@@ -1,28 +1,33 @@
-# %%capture
-# ── Instala dependencias la primera vez (Drive, Pillow y Matplotlib) ──
-# !pip install --quiet google-auth google-auth-oauthlib google-api-python-client pillow matplotlib
+#!/usr/bin/env python3
+"""
+Descarga una imagen de Google Drive y la muestra:
+• Si hay backend GUI ➜ ventana interactiva
+• Si no ➜ la guarda como PNG y avisa la ruta
+"""
 
-# ╔════════════════════════════════════════════════════════════════════╗
-# ║  Descarga una imagen de Google Drive y la muestra dentro de Colab  ║
-# ╚════════════════════════════════════════════════════════════════════╝
-
-# ── Activa la salida ‘inline’ sólo si estamos en IPython/Jupyter ─────
-import matplotlib.pyplot as plt
-from IPython import get_ipython
-
-shell = get_ipython()
-if shell is not None:                       # Dentro de Colab/Jupyter
-    shell.run_line_magic("matplotlib", "inline")  # equivale a %matplotlib inline
-
-import io
-import pathlib
+import io, pathlib, os, sys
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 from PIL import Image
+import matplotlib
+import matplotlib.pyplot as plt
 
-# ── 1. Autenticación ─────────────────────────────────────────────────
+# ── Seleccionar backend ────────────────────────────────────────────────────────
+if os.environ.get("DISPLAY", "") == "" and sys.platform != "win32":
+    # Entorno sin servidor X → backend headless
+    matplotlib.use("Agg")
+    HEADLESS = True
+else:
+    # Hay GUI → intenta TkAgg (o el que tengas)
+    try:
+        matplotlib.use("TkAgg")
+    except Exception:
+        pass
+    HEADLESS = False
+
+# ── 1. Autenticación ───────────────────────────────────────────────────────────
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 TOKEN_FILE = pathlib.Path("token.json")
 CREDS_FILE = pathlib.Path("credentials.json")   # tu archivo OAuth 2.0
@@ -36,20 +41,17 @@ else:
 
 drive = build("drive", "v3", credentials=creds)
 
-# ── 2. Buscar el archivo ─────────────────────────────────────────────
-FILENAME = "resultado_analisis_chico.jpg"       # cámbialo a tu nombre
+# ── 2. Buscar el archivo ───────────────────────────────────────────────────────
+FILENAME = "resultado_analisis_chico.jpg"
 query = f"name='{FILENAME}' and trashed=false"
-resp = drive.files().list(
-    q=query, spaces="drive",
-    fields="files(id, name)", pageSize=1
-).execute()
-
+resp = drive.files().list(q=query, spaces="drive",
+                          fields="files(id, name)", pageSize=1).execute()
 if not resp["files"]:
-    raise FileNotFoundError(f"No se encontró '{FILENAME}' en tu Google Drive.")
+    raise FileNotFoundError(f"No se encontró '{FILENAME}'.")
 
 file_id = resp["files"][0]["id"]
 
-# ── 3. Descargar el contenido ────────────────────────────────────────
+# ── 3. Descargar el contenido ──────────────────────────────────────────────────
 buf = io.BytesIO()
 downloader = MediaIoBaseDownload(buf, drive.files().get_media(fileId=file_id))
 done = False
@@ -59,7 +61,15 @@ while not done:
 buf.seek(0)
 img = Image.open(buf)
 
-# ── 4. Mostrar la imagen *inline* ────────────────────────────────────
+# ── 4. Mostrar o guardar según el backend ──────────────────────────────────────
 plt.imshow(img)
-plt.axis("off")          # quita los ejes
-plt.show()
+plt.axis("off")
+plt.title(FILENAME)
+plt.tight_layout()
+
+if HEADLESS:
+    out_path = pathlib.Path("preview.png")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"No hay backend gráfico. Imagen guardada en {out_path.resolve()}")
+else:
+    plt.show(block=True)          # ventana interactiva

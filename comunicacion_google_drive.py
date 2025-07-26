@@ -1,20 +1,31 @@
 #!/usr/bin/env python3
 """
-Descarga una imagen desde Google Drive y la muestra con matplotlib.
-Requiere:
-    pip install google-auth google-auth-oauthlib google-api-python-client pillow matplotlib
+Descarga una imagen de Google Drive y la muestra:
+• Si hay backend GUI ➜ ventana interactiva
+• Si no ➜ la guarda como PNG y avisa la ruta
 """
 
-import io
-import pathlib
-
+import io, pathlib, os, sys
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-
 from PIL import Image
+import matplotlib
 import matplotlib.pyplot as plt
+
+# ── Seleccionar backend ────────────────────────────────────────────────────────
+if os.environ.get("DISPLAY", "") == "" and sys.platform != "win32":
+    # Entorno sin servidor X → backend headless
+    matplotlib.use("Agg")
+    HEADLESS = True
+else:
+    # Hay GUI → intenta TkAgg (o el que tengas)
+    try:
+        matplotlib.use("TkAgg")
+    except Exception:
+        pass
+    HEADLESS = False
 
 # ── 1. Autenticación ───────────────────────────────────────────────────────────
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
@@ -30,36 +41,35 @@ else:
 
 drive = build("drive", "v3", credentials=creds)
 
-# ── 2. Buscar el archivo (primer match) ────────────────────────────────────────
+# ── 2. Buscar el archivo ───────────────────────────────────────────────────────
 FILENAME = "resultado_analisis_chico.jpg"
 query = f"name='{FILENAME}' and trashed=false"
-results = drive.files().list(
-    q=query,
-    spaces="drive",
-    fields="files(id, name)",
-    pageSize=1,
-).execute()
+resp = drive.files().list(q=query, spaces="drive",
+                          fields="files(id, name)", pageSize=1).execute()
+if not resp["files"]:
+    raise FileNotFoundError(f"No se encontró '{FILENAME}'.")
 
-if not results["files"]:
-    raise FileNotFoundError(f"No se encontró '{FILENAME}' en tu Google Drive.")
+file_id = resp["files"][0]["id"]
 
-file_id = results["files"][0]["id"]
-
-# ── 3. Descargar ───────────────────────────────────────────────────────────────
-request = drive.files().get_media(fileId=file_id)
-buffer = io.BytesIO()
-downloader = MediaIoBaseDownload(buffer, request)
-
+# ── 3. Descargar el contenido ──────────────────────────────────────────────────
+buf = io.BytesIO()
+downloader = MediaIoBaseDownload(buf, drive.files().get_media(fileId=file_id))
 done = False
 while not done:
-    status, done = downloader.next_chunk()  # puedes imprimir status.progress() si quieres
+    _, done = downloader.next_chunk()
 
-buffer.seek(0)
-image = Image.open(buffer)
+buf.seek(0)
+img = Image.open(buf)
 
-# ── 4. Mostrar con matplotlib (funciona en entornos sin visor gráfico) ────────
-plt.imshow(image)
-plt.axis("off")         # quita ejes
+# ── 4. Mostrar o guardar según el backend ──────────────────────────────────────
+plt.imshow(img)
+plt.axis("off")
 plt.title(FILENAME)
 plt.tight_layout()
-plt.show()
+
+if HEADLESS:
+    out_path = pathlib.Path("preview.png")
+    plt.savefig(out_path, dpi=150, bbox_inches="tight")
+    print(f"No hay backend gráfico. Imagen guardada en {out_path.resolve()}")
+else:
+    plt.show(block=True)          # ventana interactiva

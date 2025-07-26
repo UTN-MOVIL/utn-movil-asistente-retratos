@@ -80,10 +80,10 @@ def verificar_presencia_de_lentes(ruta_imagen: str, umbral: float = 0.5) -> str:
         return f"Imagen contiene lentes (prob. ≈ {prob:.2f})"
     return f"Imagen NO contiene lentes (prob. ≈ {prob:.2f})"
 
-# ── 5. Ejemplo de uso ----------------------------------------------------------
-if __name__ == "__main__":
-    ruta = (
-        r"C:\Users\Administrador\Documents\INGENIERIA_EN_SOFTWARE"
-        r"\PROYECTO_FOTOGRAFIAS_ESTUDIANTES\datasets\validated_color\0104651666.jpg"
-    )
-    print("Resultado final:", verificar_presencia_de_lentes(ruta))
+# # ── 5. Ejemplo de uso ----------------------------------------------------------
+# if __name__ == "__main__":
+#     ruta = (
+#         r"C:\Users\Administrador\Documents\INGENIERIA_EN_SOFTWARE"
+#         r"\PROYECTO_FOTOGRAFIAS_ESTUDIANTES\datasets\validated_color\0104651666.jpg"
+#     )
+#     print("Resultado final:", verificar_presencia_de_lentes(ruta))

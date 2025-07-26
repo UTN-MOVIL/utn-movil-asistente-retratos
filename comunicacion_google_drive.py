@@ -1,31 +1,23 @@
-#!/usr/bin/env python3
-"""
-Descarga una imagen de Google Drive y la muestra:
-• Si hay backend GUI ➜ ventana interactiva
-• Si no ➜ la guarda como PNG y avisa la ruta
-"""
+# %%capture
+# ── Instala dependencias la primera vez (Drive, Pillow y Matplotlib) ──
+# !pip install --quiet google-auth google-auth-oauthlib google-api-python-client pillow matplotlib
 
-import io, pathlib, os, sys
+# ╔════════════════════════════════════════════════════════════════════╗
+# ║  Descarga una imagen de Google Drive y la muestra dentro de Colab  ║
+# ╚════════════════════════════════════════════════════════════════════╝
+
+# Activa la salida gráfica “inline” (en Colab suele estar por defecto)
+%matplotlib inline          # normalmente ya está activo
+
+import io
+import pathlib
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-from PIL import Image
-import matplotlib
-import matplotlib.pyplot as plt
 
-# ── Seleccionar backend ────────────────────────────────────────────────────────
-if os.environ.get("DISPLAY", "") == "" and sys.platform != "win32":
-    # Entorno sin servidor X → backend headless
-    matplotlib.use("Agg")
-    HEADLESS = True
-else:
-    # Hay GUI → intenta TkAgg (o el que tengas)
-    try:
-        matplotlib.use("TkAgg")
-    except Exception:
-        pass
-    HEADLESS = False
+from PIL import Image
+import matplotlib.pyplot as plt
 
 # ── 1. Autenticación ───────────────────────────────────────────────────────────
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
@@ -42,12 +34,17 @@ else:
 drive = build("drive", "v3", credentials=creds)
 
 # ── 2. Buscar el archivo ───────────────────────────────────────────────────────
-FILENAME = "resultado_analisis_chico.jpg"
+FILENAME = "resultado_analisis_chico.jpg"       # cámbialo a tu nombre de archivo
 query = f"name='{FILENAME}' and trashed=false"
-resp = drive.files().list(q=query, spaces="drive",
-                          fields="files(id, name)", pageSize=1).execute()
+resp = drive.files().list(
+    q=query,
+    spaces="drive",
+    fields="files(id, name)",
+    pageSize=1
+).execute()
+
 if not resp["files"]:
-    raise FileNotFoundError(f"No se encontró '{FILENAME}'.")
+    raise FileNotFoundError(f"No se encontró '{FILENAME}' en tu Google Drive.")
 
 file_id = resp["files"][0]["id"]
 
@@ -61,15 +58,7 @@ while not done:
 buf.seek(0)
 img = Image.open(buf)
 
-# ── 4. Mostrar o guardar según el backend ──────────────────────────────────────
+# ── 4. Mostrar la imagen *inline* ──────────────────────────────────────────────
 plt.imshow(img)
-plt.axis("off")
-plt.title(FILENAME)
-plt.tight_layout()
-
-if HEADLESS:
-    out_path = pathlib.Path("preview.png")
-    plt.savefig(out_path, dpi=150, bbox_inches="tight")
-    print(f"No hay backend gráfico. Imagen guardada en {out_path.resolve()}")
-else:
-    plt.show(block=True)          # ventana interactiva
+plt.axis('off')           # quita los ejes
+plt.show()

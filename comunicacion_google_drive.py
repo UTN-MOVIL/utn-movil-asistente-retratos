@@ -6,8 +6,13 @@
 # ║  Descarga una imagen de Google Drive y la muestra dentro de Colab  ║
 # ╚════════════════════════════════════════════════════════════════════╝
 
-# Activa la salida gráfica “inline” (en Colab suele estar por defecto)
-%matplotlib inline          # normalmente ya está activo
+# ── Activa la salida ‘inline’ sólo si estamos en IPython/Jupyter ─────
+import matplotlib.pyplot as plt
+from IPython import get_ipython
+
+shell = get_ipython()
+if shell is not None:                       # Dentro de Colab/Jupyter
+    shell.run_line_magic("matplotlib", "inline")  # equivale a %matplotlib inline
 
 import io
 import pathlib
@@ -15,11 +20,9 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
-
 from PIL import Image
-import matplotlib.pyplot as plt
 
-# ── 1. Autenticación ───────────────────────────────────────────────────────────
+# ── 1. Autenticación ─────────────────────────────────────────────────
 SCOPES = ["https://www.googleapis.com/auth/drive.readonly"]
 TOKEN_FILE = pathlib.Path("token.json")
 CREDS_FILE = pathlib.Path("credentials.json")   # tu archivo OAuth 2.0
@@ -33,14 +36,12 @@ else:
 
 drive = build("drive", "v3", credentials=creds)
 
-# ── 2. Buscar el archivo ───────────────────────────────────────────────────────
-FILENAME = "resultado_analisis_chico.jpg"       # cámbialo a tu nombre de archivo
+# ── 2. Buscar el archivo ─────────────────────────────────────────────
+FILENAME = "resultado_analisis_chico.jpg"       # cámbialo a tu nombre
 query = f"name='{FILENAME}' and trashed=false"
 resp = drive.files().list(
-    q=query,
-    spaces="drive",
-    fields="files(id, name)",
-    pageSize=1
+    q=query, spaces="drive",
+    fields="files(id, name)", pageSize=1
 ).execute()
 
 if not resp["files"]:
@@ -48,7 +49,7 @@ if not resp["files"]:
 
 file_id = resp["files"][0]["id"]
 
-# ── 3. Descargar el contenido ──────────────────────────────────────────────────
+# ── 3. Descargar el contenido ────────────────────────────────────────
 buf = io.BytesIO()
 downloader = MediaIoBaseDownload(buf, drive.files().get_media(fileId=file_id))
 done = False
@@ -58,7 +59,7 @@ while not done:
 buf.seek(0)
 img = Image.open(buf)
 
-# ── 4. Mostrar la imagen *inline* ──────────────────────────────────────────────
+# ── 4. Mostrar la imagen *inline* ────────────────────────────────────
 plt.imshow(img)
-plt.axis('off')           # quita los ejes
+plt.axis("off")          # quita los ejes
 plt.show()

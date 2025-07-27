@@ -252,7 +252,7 @@ if __name__ == "__main__":
         info = {
             "Rutas": format_to_hyperlinks(paths),
             "Probabilidad": probs,
-            "Detección": ["SÍ" if p>=0.5 else "NO" for p in probs]
+            "Detección": ["SÍ" if p>=0.45 else "NO" for p in probs]
         }
         normalized = normalize_dict_lengths(info)
         out = dict_to_excel(

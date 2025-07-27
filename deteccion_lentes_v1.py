@@ -61,12 +61,12 @@ print(f"[INFO] Modelo listo en {device}")
 
 # ─────────── 5. Utilidades de inferencia ─────────────────────────────────────
 def get_glasses_probability(ruta_imagen:str, umbral_min:float=0.0)->float:
-    print(f"[INFO] Inferencia sobre {ruta_imagen}")
+    #print(f"[INFO] Inferencia sobre {ruta_imagen}")
     if not os.path.exists(ruta_imagen):
         raise FileNotFoundError(ruta_imagen)
     dets: sv.Detections = detic_model.predict(ruta_imagen)
     confs = [c for c in (dets.confidence or []) if c>=umbral_min]
-    print(f"[INFO] Confianzas filtradas (≥{umbral_min}): {confs}")
+    #print(f"[INFO] Confianzas filtradas (≥{umbral_min}): {confs}")
     return max(confs, default=0.0)
 
 def verificar_presencia_de_lentes(ruta_imagen:str, umbral:float=0.5)->str:

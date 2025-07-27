@@ -3,6 +3,7 @@ import os
 import io
 import sys
 import tempfile
+from tqdm import tqdm
 from typing import List, Tuple
 
 from google.oauth2.credentials import Credentials
@@ -119,7 +120,7 @@ def process_drive_folder(drive_folder_path: str) -> Tuple[List[str], List[float]
     image_paths: List[str] = []
     glasses_probs: List[float] = []
 
-    for file_id, name in files:
+    for file_id, name in tqdm(files, desc="Procesando archivos", unit="archivo"):
         local_path = os.path.join(temp_dir, name)
         try:
             download_file(file_id, local_path, drive)

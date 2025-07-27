@@ -14,8 +14,9 @@ import pathlib
 import tqdm
 import torch
 import supervision as sv
-import cv2  # Opcional: solo si vas a visualizar resultados
+import cv2                                 # opcional
 from pathlib import Path
+import shutil                              # ← nuevo
 from autodistill_detic import DETIC
 from autodistill.detection import CaptionOntology
 
@@ -40,8 +41,8 @@ else:
     print(f"[INFO] ✅  Pesos ya presentes en {WEIGHTS_LOCAL}")
 
 # ───────────────── 2. Rutas de Detic ──────────────────────────────────────────
-detic_root = Path(__file__).parent / "Detic"        # Ajusta si tu carpeta cambia
-cfg_file   = detic_root / "configs" / "Detic_LCOCOI21k_CLIP_SwinB_896b32_4x_ft4x_max-size.yaml"
+detic_root = Path(__file__).parent / "Detic"        # ajusta si cambia
+cfg_file   = detic_root / "configs" / WEIGHTS_NAME.replace(".pth", ".yaml")
 
 print(f"[INFO] Detic root           : {detic_root}")
 print(f"[INFO] Existe Detic root?   : {detic_root.is_dir()}")
@@ -53,17 +54,25 @@ if str(detic_root) not in sys.path:
     sys.path.insert(0, str(detic_root))
     print(f"[INFO] sys.path ← {detic_root}")
 
-# ───────────────── 3. Construir modelo Detic ─────────────────────────────────
-os.environ["DETIC_CONFIG"] = str(cfg_file)          # Autodistill buscará aquí
-print("[INFO] Variable de entorno DETIC_CONFIG definida.")
+# ───────────────── 3. Copiar YAML al directorio de trabajo ───────────────────
+local_cfg_dir = Path.cwd() / "configs"
+local_cfg_dir.mkdir(exist_ok=True)
 
+target_yaml = local_cfg_dir / cfg_file.name
+if not target_yaml.exists():
+    shutil.copy(cfg_file, target_yaml)
+    print(f"[INFO] Copiado YAML → {target_yaml}")
+else:
+    print(f"[INFO] YAML ya presente en {target_yaml}")
+
+# ───────────────── 4. Construir modelo Detic ─────────────────────────────────
 ontology     = CaptionOntology({"eyeglasses": "eyeglasses"})
 print("[INFO] Creando modelo DETIC …")
-detic_model  = DETIC(ontology=ontology)
+detic_model  = DETIC(ontology=ontology)             # ya no revienta
 device       = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[INFO] Modelo inicializado; dispositivo detectado → {device}")
 
-# ───────────────── 4. Utilidades de inferencia ───────────────────────────────
+# ───────────────── 5. Utilidades de inferencia ───────────────────────────────
 def get_glasses_probability(ruta_imagen: str, umbral_min: float = 0.0) -> float:
     """
     Devuelve la mayor probabilidad de detección de lentes en la imagen.
@@ -92,7 +101,7 @@ def verificar_presencia_de_lentes(ruta_imagen: str, umbral: float = 0.5) -> str:
     print(f"[INFO] Resultado final: {msg}")
     return msg
 
-# # ───────────────── 5. Ejemplo de uso ─────────────────────────────────────────
+# # ───────────────── 6. Ejemplo de uso ─────────────────────────────────────────
 # if __name__ == "__main__":
 #     ruta = (
 #         r"C:\Users\Administrador\Documents\INGENIERIA_EN_SOFTWARE"

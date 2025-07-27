@@ -5,7 +5,7 @@ Requisitos:
     pip install autodistill-detic supervision opencv-python torch torchvision tqdm
     (y clonar el repo oficial de Detic en una sub-carpeta ./Detic)
 """
-import os, sys, urllib.request, pathlib, shutil, tqdm, torch, supervision as sv, cv2
+import os, sys, urllib.request, shutil, tqdm, torch, supervision as sv, cv2
 from pathlib import Path
 from autodistill_detic import DETIC
 from autodistill.detection import CaptionOntology
@@ -29,17 +29,17 @@ else:
     print(f"[INFO] ✅  Pesos ya presentes en {WEIGHTS_LOCAL}")
 
 # ───────────────── 2. Rutas Detic ────────────────────────────────────────────
-detic_root = Path(__file__).parent/"Detic"          # ajusta si cambia
+detic_root = Path(__file__).parent/"Detic"          # repo clonado
 cfg_file   = detic_root/"configs"/WEIGHTS_NAME.replace(".pth",".yaml")
 print(f"[INFO] Detic root            : {detic_root} | existe → {detic_root.is_dir()}")
-print(f"[INFO] YAML de configuración : {cfg_file}  | existe → {cfg_file.exists()}")
+print(f"[INFO] YAML original         : {cfg_file}  | existe → {cfg_file.exists()}")
 
 # Añade Detic al PYTHONPATH
 if str(detic_root) not in sys.path:
     sys.path.insert(0, str(detic_root))
     print(f"[INFO] sys.path ← {detic_root}")
 
-# ─────────── 3. (opcional) copia YAML a ./configs de CWD ─────────────────────
+# ─────────── 3. Copia YAML al directorio de trabajo ./configs ────────────────
 local_cfg_dir = Path.cwd()/"configs"
 local_cfg_dir.mkdir(exist_ok=True)
 target_yaml   = local_cfg_dir/cfg_file.name
@@ -49,18 +49,17 @@ if not target_yaml.exists():
 else:
     print(f"[INFO] YAML ya presente en {target_yaml}")
 
-# ─────────── 4. Cambiar CWD a la raíz de Detic ───────────────────────────────
-os.chdir(detic_root)
-print(f"[INFO] Directorio de trabajo cambiado a {Path.cwd()}")
+# (¡NO cambiamos de directorio! El cwd sigue siendo {Path.cwd()})
+print(f"[INFO] Directorio de trabajo actual → {Path.cwd()}")
 
-# ─────────── 5. Construir modelo Detic ───────────────────────────────────────
+# ─────────── 4. Construir modelo Detic ───────────────────────────────────────
 ontology    = CaptionOntology({"eyeglasses":"eyeglasses"})
 print("[INFO] Creando modelo DETIC …")
-detic_model = DETIC(ontology=ontology)              # ya no lanza AssertionError
+detic_model = DETIC(ontology=ontology)              # ahora sí inicia
 device      = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[INFO] Modelo listo en {device}")
 
-# ─────────── 6. Utilidades de inferencia ─────────────────────────────────────
+# ─────────── 5. Utilidades de inferencia ─────────────────────────────────────
 def get_glasses_probability(ruta_imagen:str, umbral_min:float=0.0)->float:
     print(f"[INFO] Inferencia sobre {ruta_imagen}")
     if not os.path.exists(ruta_imagen):
@@ -77,8 +76,10 @@ def verificar_presencia_de_lentes(ruta_imagen:str, umbral:float=0.5)->str:
             f"Imagen NO contiene lentes (prob.≈{prob:.2f})")
     print(f"[INFO] {msg}"); return msg
 
-# # ─────────── 7. Ejemplo rápido ───────────────────────────────────────────────
-# if __name__=="__main__":
-#     ruta = (r"C:\Users\Administrador\Documents\INGENIERIA_EN_SOFTWARE"
-#             r"\PROYECTO_FOTOGRAFIAS_ESTUDIANTES\datasets\validated_color\0104651666.jpg")
-#     verificar_presencia_de_lentes(ruta)
+# ─────────── 6. Ejemplo rápido ───────────────────────────────────────────────
+if __name__=="__main__":
+    ruta = (
+        r"C:\Users\Administrador\Documents\INGENIERIA_EN_SOFTWARE"
+        r"\PROYECTO_FOTOGRAFIAS_ESTUDIANTES\datasets\validated_color\0104651666.jpg"
+    )
+    verificar_presencia_de_lentes(ruta)

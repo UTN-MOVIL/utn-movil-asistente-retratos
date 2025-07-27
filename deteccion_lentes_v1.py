@@ -192,7 +192,7 @@ def get_glasses_probability_batch(
 
 
 # ──────────────────────── Helpers de alto nivel ──────────────────────────────
-def verificar_presencia_de_lentes(ruta_imagen: str, umbral: float = 0.5) -> str:
+def verificar_presencia_de_lentes(ruta_imagen: str, umbral: float = 0.45) -> str:
     prob = get_glasses_probability(ruta_imagen, umbral)
     msg = (
         f"Imagen contiene lentes (prob.≈{prob:.2f})"
@@ -205,7 +205,7 @@ def verificar_presencia_de_lentes(ruta_imagen: str, umbral: float = 0.5) -> str:
 
 def procesar_lote_imagenes(
     rutas_imagenes: Iterable[str],
-    umbral: float = 0.5,
+    umbral: float = 0.45,
     mostrar_progreso: bool = True,
     usar_batch: bool = True,
 ) -> Dict[str, float]:

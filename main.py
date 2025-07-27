@@ -3,15 +3,16 @@ import os
 import io
 import sys
 import tempfile
-from tqdm import tqdm
+import threading
+from queue import Queue
 from typing import List, Tuple
+from tqdm import tqdm
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-# CAMBIO 1: Importar funciones optimizadas en lugar de la versión básica
 from deteccion_lentes_v1 import (
     get_glasses_probability,
     get_glasses_probability_batch,
@@ -44,23 +45,18 @@ def drive_service():
     return build("drive", "v3", credentials=creds)
 
 def get_folder_id_by_path(path: str, drive):
-    """Del estilo '/Mi unidad/Carp1/Carp2' devuelve el ID de la última carpeta."""
     segments  = [s for s in path.strip("/").split("/") if s and s != "Mi unidad"]
     parent_id = "root"
     for name in segments:
-        resp = (
-            drive.files()
-            .list(
-                q=(
-                    f"name = '{name}' and "
-                    "mimeType = 'application/vnd.google-apps.folder' and "
-                    f"'{parent_id}' in parents and trashed = false"
-                ),
-                fields="files(id)",
-                pageSize=1,
-            )
-            .execute()
-        )
+        resp = drive.files().list(
+            q=(
+                f"name = '{name}' and "
+                "mimeType = 'application/vnd.google-apps.folder' and "
+                f"'{parent_id}' in parents and trashed = false"
+            ),
+            fields="files(id)",
+            pageSize=1,
+        ).execute()
         items = resp.get("files", [])
         if not items:
             raise FileNotFoundError(f"Carpeta '{name}' no encontrada (parent={parent_id})")
@@ -68,31 +64,17 @@ def get_folder_id_by_path(path: str, drive):
     return parent_id
 
 def list_files_recursive(folder_id: str, drive) -> List[Tuple[str, str]]:
-    """
-    Devuelve pares (file_id, drive_path) de todos los archivos (no carpetas)
-    dentro de la carpeta indicada y sus subcarpetas.
-    """
     results = []
-
-    # primero listamos el contenido directo
     query = f"'{folder_id}' in parents and trashed = false"
     page_token = None
     while True:
-        resp = (
-            drive.files()
-            .list(
-                q=query,
-                fields=(
-                    "nextPageToken, "
-                    "files(id, name, mimeType, parents)"
-                ),
-                pageToken=page_token,
-            )
-            .execute()
-        )
+        resp = drive.files().list(
+            q=query,
+            fields="nextPageToken, files(id, name, mimeType)",
+            pageToken=page_token,
+        ).execute()
         for f in resp["files"]:
             if f["mimeType"] == "application/vnd.google-apps.folder":
-                # recursión en subcarpeta
                 results.extend(list_files_recursive(f["id"], drive))
             else:
                 results.append((f["id"], f["name"]))
@@ -101,181 +83,188 @@ def list_files_recursive(folder_id: str, drive) -> List[Tuple[str, str]]:
             break
     return results
 
-def download_file(file_id: str, dest_path: str, drive):
-    """Descarga un archivo de Drive al path local indicado."""
+# OPTIMIZACIÓN: descarga con chunks grandes
+def download_file_optimized(file_id: str, dest_path: str, drive, chunk_size: int = 10 * 1024 * 1024):
     request = drive.files().get_media(fileId=file_id)
-    fh      = io.FileIO(dest_path, "wb")
-    downloader = MediaIoBaseDownload(fh, request)
+    fh = io.FileIO(dest_path, "wb")
+    downloader = MediaIoBaseDownload(fh, request, chunksize=chunk_size)
     done = False
     while not done:
-        status, done = downloader.next_chunk()
+        _, done = downloader.next_chunk()
+    fh.close()
 
-# ── NUEVA VERSIÓN OPTIMIZADA: Procesamiento con batch ───────────────────────
-def process_drive_folder_optimized(drive_folder_path: str, usar_batch: bool = True, 
-                                 umbral_minimo: float = 0.0) -> Tuple[List[str], List[float]]:
-    """
-    VERSIÓN ULTRA-OPTIMIZADA del procesamiento de carpeta Drive.
-    
-    Args:
-        drive_folder_path: Ruta de la carpeta en Drive
-        usar_batch: Si True, usa procesamiento en batch (MUY recomendado)
-        umbral_minimo: Umbral mínimo de confianza para filtrar detecciones
-    
-    Returns:
-        Tupla con (rutas_locales, probabilidades_lentes)
-    """
-    print("[INFO] 🚀 Iniciando procesamiento ultra-optimizado...")
-    
-    # Configurar optimizaciones al inicio
-    configurar_optimizaciones_gpu()
-    warm_up_modelo()
-    
-    drive = drive_service()
-    folder_id = get_folder_id_by_path(drive_folder_path, drive)
-
-    files = list_files_recursive(folder_id, drive)
-    if not files:
-        print("No se encontraron archivos.")
-        return [], []
-
-    print(f"[INFO] Encontrados {len(files)} archivos para procesar")
-    
-    temp_dir = tempfile.mkdtemp(prefix="glasses_optimized_")
-    print(f"[INFO] Directorio temporal: {temp_dir}")
-    
-    # FASE 1: Descarga de archivos (con filtrado por extensión)
-    valid_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'}
-    image_paths: List[str] = []
-    
-    print("[INFO] 📥 Descargando archivos...")
-    for file_id, name in tqdm(files, desc="Descargando", unit="archivo"):
-        # Filtrar por extensión antes de descargar
-        if not any(name.lower().endswith(ext) for ext in valid_extensions):
-            continue
-            
+# Worker para descarga en paralelo
+def download_worker(q_in: Queue, q_out: Queue, drive_service_func, temp_dir: str):
+    drive = drive_service_func()
+    while True:
+        item = q_in.get()
+        if item is None:
+            break
+        file_id, name = item
         local_path = os.path.join(temp_dir, name)
         try:
-            download_file(file_id, local_path, drive)
-            image_paths.append(local_path)
+            download_file_optimized(file_id, local_path, drive)
+            q_out.put(('success', local_path))
         except Exception as e:
-            print(f"[ERROR] Saltando descarga de {name!r}: {e}")
-            continue
-    
+            q_out.put(('error', f"{name}: {e}"))
+        finally:
+            q_in.task_done()
+
+# Función de ayuda: descargas paralelas
+def download_files_parallel(
+    files: List[Tuple[str, str]],
+    temp_dir: str,
+    drive_service_func,
+    max_workers: int = 4
+) -> List[str]:
+    valid_ext = {'.jpg','.jpeg','.png','.bmp','.tiff','.webp'}
+    valid = [(fid,name) for fid,name in files if any(name.lower().endswith(ext) for ext in valid_ext)]
+    if not valid:
+        print("[WARNING] No hay imágenes válidas")
+        return []
+
+    q_in = Queue()
+    q_out = Queue()
+    for item in valid:
+        q_in.put(item)
+
+    threads = []
+    for _ in range(max_workers):
+        t = threading.Thread(
+            target=download_worker,
+            args=(q_in, q_out, drive_service_func, temp_dir),
+            daemon=True
+        )
+        t.start()
+        threads.append(t)
+
+    image_paths = []
+    errors = 0
+    with tqdm(total=len(valid), desc="Descargando", unit="archivo") as pbar:
+        done = 0
+        while done < len(valid):
+            try:
+                status, val = q_out.get(timeout=1)
+                if status == 'success':
+                    image_paths.append(val)
+                else:
+                    print(f"[ERROR] {val}")
+                    errors += 1
+                done += 1
+                pbar.update(1)
+                pbar.set_postfix(exitosos=len(image_paths), errores=errors)
+            except:
+                continue
+
+    # Señales de cierre
+    for _ in threads:
+        q_in.put(None)
+    for t in threads:
+        t.join()
+
+    print(f"[INFO] Descarga completa: {len(image_paths)} éxitos, {errors} errores")
+    return image_paths
+
+# ── Versión optimizada con descarga paralela ─────────────────────────────────
+def process_drive_folder_optimized(
+    drive_folder_path: str,
+    usar_batch: bool = True,
+    umbral_minimo: float = 0.0,
+    max_workers: int = 4
+) -> Tuple[List[str], List[float]]:
+    print("[INFO] 🚀 Iniciando procesamiento ultra-optimizado...")
+    configurar_optimizaciones_gpu()
+    warm_up_modelo()
+
+    drive = drive_service()
+    folder_id = get_folder_id_by_path(drive_folder_path, drive)
+    files = list_files_recursive(folder_id, drive)
+    if not files:
+        print("[ERROR] No se encontraron archivos.")
+        return [], []
+
+    print(f"[INFO] Encontrados {len(files)} archivos")
+
+    temp_dir = tempfile.mkdtemp(prefix="glasses_optimized_")
+    print(f"[INFO] Directorio temporal: {temp_dir}")
+
+    # FASE 1: Descarga paralela
+    image_paths = download_files_parallel(files, temp_dir, drive_service, max_workers)
     if not image_paths:
         print("[WARNING] No se descargaron imágenes válidas")
         return [], []
-    
+
     print(f"[INFO] ✅ Descargadas {len(image_paths)} imágenes")
-    
-    # FASE 2: Procesamiento optimizado de detección de lentes
     print("[INFO] 🔍 Iniciando detección de lentes...")
-    
+
+    # FASE 2: Detección
     if usar_batch and len(image_paths) > 1:
-        # PROCESAMIENTO EN BATCH (ULTRA-RÁPIDO)
-        print(f"[INFO] Usando procesamiento en batch para {len(image_paths)} imágenes")
         glasses_probs = get_glasses_probability_batch(image_paths, umbral_minimo)
-        
-        # Mostrar progreso y estadísticas
-        detecciones_positivas = sum(1 for p in glasses_probs if p > 0.5)
-        print(f"[INFO] ✅ Procesamiento batch completado")
-        print(f"[INFO] 📊 Detecciones positivas: {detecciones_positivas}/{len(glasses_probs)}")
-        
+        pos = sum(1 for p in glasses_probs if p > 0.5)
+        print(f"[INFO] ✅ Batch completado ({pos}/{len(glasses_probs)} positivos)")
     else:
-        # PROCESAMIENTO INDIVIDUAL (para casos especiales)
-        print("[INFO] Usando procesamiento individual optimizado")
         glasses_probs: List[float] = []
-        
         for path in tqdm(image_paths, desc="Detectando lentes", unit="imagen"):
             try:
-                prob = get_glasses_probability(path, umbral_minimo)
-                glasses_probs.append(prob)
+                glasses_probs.append(get_glasses_probability(path, umbral_minimo))
             except Exception as e:
-                print(f"[ERROR] Error procesando {path}: {e}")
+                print(f"[ERROR] {path}: {e}")
                 glasses_probs.append(0.0)
-    
+
     # FASE 3: Estadísticas finales
     print("[INFO] 📈 Estadísticas finales:")
     obtener_estadisticas_cache()
-    
-    # Estadísticas de detección
-    total_imagenes = len(glasses_probs)
+    total = len(glasses_probs)
     con_lentes = sum(1 for p in glasses_probs if p >= 0.5)
-    sin_lentes = total_imagenes - con_lentes
-    prob_promedio = sum(glasses_probs) / total_imagenes if total_imagenes > 0 else 0
-    
-    print(f"[INFO] 👓 Con lentes: {con_lentes} ({con_lentes/total_imagenes*100:.1f}%)")
-    print(f"[INFO] 👁️  Sin lentes: {sin_lentes} ({sin_lentes/total_imagenes*100:.1f}%)")
-    print(f"[INFO] 📊 Probabilidad promedio: {prob_promedio:.3f}")
-    
+    sin_lentes = total - con_lentes
+    prom = sum(glasses_probs) / total if total else 0
+    print(f"👓 Con lentes: {con_lentes} ({con_lentes/total*100:.1f}%)")
+    print(f"👁️ Sin lentes: {sin_lentes} ({sin_lentes/total*100:.1f}%)")
+    print(f"📊 Promedio: {prom:.3f}")
+
     return image_paths, glasses_probs
 
-# ── VERSIÓN COMPATIBLE (mantiene la interfaz original) ───────────────────────
+# ── Interfaz compatible ──────────────────────────────────────────────────────
 def process_drive_folder(drive_folder_path: str) -> Tuple[List[str], List[float]]:
-    """
-    Versión compatible que usa internamente las optimizaciones.
-    Mantiene la misma interfaz que el código original.
-    """
     return process_drive_folder_optimized(drive_folder_path, usar_batch=True)
 
-# ── Main con opciones avanzadas ──────────────────────────────────────────────
+# ── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    print("🚀 DETECTOR DE LENTES ULTRA-OPTIMIZADO")
-    print("=" * 50)
-    
-    # Configuración
     dataset_drive_path = (
         "/Mi unidad/INGENIERIA_EN_SOFTWARE/6to_Semestre/"
         "PRACTICAS/Practicas-FOTOS/Primera_Revision/"
         "validator/results/validated_color"
     )
-    
-    # OPCIONES DE CONFIGURACIÓN
-    USAR_BATCH = True           # True para máximo rendimiento
-    UMBRAL_MINIMO = 0.0        # Umbral mínimo de confianza
-    UMBRAL_DETECCION = 0.5     # Umbral para considerar "con lentes"
-    
-    results_folder = "results"
-    os.makedirs(results_folder, exist_ok=True)
+    USAR_BATCH = True
+    UMBRAL_MIN = 0.0
+    MAX_THREADS = 6
 
     try:
-        # Usar versión optimizada
-        print(f"[INFO] Procesando carpeta: {dataset_drive_path}")
         paths, probs = process_drive_folder_optimized(
-            dataset_drive_path, 
+            dataset_drive_path,
             usar_batch=USAR_BATCH,
-            umbral_minimo=UMBRAL_MINIMO
+            umbral_minimo=UMBRAL_MIN,
+            max_workers=MAX_THREADS
         )
-        
         if not paths:
-            print("[ERROR] No se procesaron imágenes. Abortando.")
             sys.exit(1)
-        
-        # Preparar datos para Excel con estadísticas adicionales
-        informacion = {
-            "Rutas": format_to_hyperlinks(paths),
-            "Probabilidad de tener lentes": probs,
-            "Detección (≥0.5)": ["SÍ" if p >= UMBRAL_DETECCION else "NO" for p in probs],
-            "Confianza": ["Alta" if p >= 0.8 else "Media" if p >= 0.5 else "Baja" for p in probs]
-        }
 
-        normalized = normalize_dict_lengths(informacion)
-        output_file = dict_to_excel(
+        info = {
+            "Rutas": format_to_hyperlinks(paths),
+            "Probabilidad": probs,
+            "Detección": ["SÍ" if p>=0.5 else "NO" for p in probs]
+        }
+        normalized = normalize_dict_lengths(info)
+        out = dict_to_excel(
             normalized,
-            f"{results_folder}/Reporte_probabilidad_lentes_OPTIMIZADO_{get_file_count(results_folder)+1}.xlsx",
+            f"results/Reporte_{get_file_count('results')+1}.xlsx"
         )
-        
-        print(f"\n✅ PROCESAMIENTO COMPLETADO")
-        print(f"📊 Excel generado en: {output_file}")
-        print(f"📁 Archivos procesados: {len(paths)}")
-        
-        # Limpiar caché al final (opcional)
-        # limpiar_cache_imagenes()
-        
+        print(f"✅ Listo. Excel generado en: {out}")
     except KeyboardInterrupt:
-        print("\n[INFO] Proceso interrumpido por el usuario")
+        print("\n[INFO] Interrumpido por usuario")
         limpiar_cache_imagenes()
         sys.exit(0)
     except Exception as e:
-        print(f"\n[ERROR] Error durante el procesamiento: {e}")
+        print(f"\n[ERROR] {e}")
         limpiar_cache_imagenes()
         sys.exit(1)

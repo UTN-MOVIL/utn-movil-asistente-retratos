@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """
-Detección de lentes en imágenes usando Autodistill + Detic.
+Detección de lentes en imágenes usando Autodistill + Detic (OPTIMIZADO).
 Requisitos:
     pip install autodistill-detic supervision opencv-python torch torchvision tqdm
     (y clonar el repo oficial de Detic en una sub-carpeta ./Detic)
 """
 import os, sys, urllib.request, shutil, tqdm, torch, supervision as sv, cv2
+import numpy as np
 from pathlib import Path
 from autodistill_detic import DETIC
 from autodistill.detection import CaptionOntology
@@ -59,27 +60,106 @@ detic_model = DETIC(ontology=ontology)              # ahora sí inicia
 device      = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[INFO] Modelo listo en {device}")
 
-# ─────────── 5. Utilidades de inferencia ─────────────────────────────────────
-def get_glasses_probability(ruta_imagen:str, umbral_min:float=0.0)->float:
-    #print(f"[INFO] Inferencia sobre {ruta_imagen}")
-    if not os.path.exists(ruta_imagen):
-        raise FileNotFoundError(ruta_imagen)
-    dets: sv.Detections = detic_model.predict(ruta_imagen)
-    confs = [c for c in (dets.confidence or []) if c>=umbral_min]
-    #print(f"[INFO] Confianzas filtradas (≥{umbral_min}): {confs}")
-    return max(confs, default=0.0)
+# OPTIMIZACIÓN: Pre-cargar imagen en memoria para evitar I/O repetido
+_image_cache = {}
+MAX_CACHE_SIZE = 50  # Limitar tamaño de caché
 
-def verificar_presencia_de_lentes(ruta_imagen:str, umbral:float=0.5)->str:
+def _load_image_optimized(ruta_imagen: str) -> np.ndarray:
+    """Carga imagen con caché en memoria y redimensionado opcional."""
+    global _image_cache
+    
+    # Limpiar caché si está muy lleno
+    if len(_image_cache) > MAX_CACHE_SIZE:
+        _image_cache.clear()
+    
+    if ruta_imagen not in _image_cache:
+        if not os.path.exists(ruta_imagen):
+            raise FileNotFoundError(f"Imagen no encontrada: {ruta_imagen}")
+            
+        img = cv2.imread(ruta_imagen)
+        if img is None:
+            raise ValueError(f"No se pudo cargar la imagen: {ruta_imagen}")
+            
+        # OPTIMIZACIÓN: Redimensionar imagen si es muy grande (>1024px en cualquier dimensión)
+        h, w = img.shape[:2]
+        if max(h, w) > 1024:
+            scale = 1024 / max(h, w)
+            new_w, new_h = int(w * scale), int(h * scale)
+            img = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            print(f"[INFO] Redimensionada {ruta_imagen}: {w}x{h} → {new_w}x{new_h}")
+        
+        _image_cache[ruta_imagen] = img
+    
+    return _image_cache[ruta_imagen]
+
+# ─────────── 5. Utilidades de inferencia OPTIMIZADAS ────────────────────────
+def get_glasses_probability(ruta_imagen: str, umbral_min: float = 0.0) -> float:
+    """
+    Versión optimizada que:
+    1. Usa caché de imágenes en memoria
+    2. Redimensiona imágenes grandes
+    3. Evita operaciones innecesarias
+    4. Retorna directamente el máximo sin crear listas intermedias
+    """
+    try:
+        # Usar imagen cacheada/optimizada
+        img = _load_image_optimized(ruta_imagen)
+        
+        # OPTIMIZACIÓN: Pasar imagen como array numpy directamente
+        dets: sv.Detections = detic_model.predict(img)
+        
+        # OPTIMIZACIÓN: Calcular máximo directamente sin crear lista intermedia
+        if dets.confidence is None or len(dets.confidence) == 0:
+            return 0.0
+            
+        max_conf = 0.0
+        for conf in dets.confidence:
+            if conf >= umbral_min and conf > max_conf:
+                max_conf = conf
+                
+        return max_conf
+        
+    except Exception as e:
+        print(f"[ERROR] Error procesando {ruta_imagen}: {e}")
+        return 0.0
+
+def verificar_presencia_de_lentes(ruta_imagen: str, umbral: float = 0.5) -> str:
+    """Función principal con logging mejorado."""
     prob = get_glasses_probability(ruta_imagen, umbral)
-    msg  = (f"Imagen contiene lentes (prob.≈{prob:.2f})"
-            if prob>=umbral else
-            f"Imagen NO contiene lentes (prob.≈{prob:.2f})")
-    print(f"[INFO] {msg}"); return msg
+    msg = (f"Imagen contiene lentes (prob.≈{prob:.2f})"
+           if prob >= umbral else
+           f"Imagen NO contiene lentes (prob.≈{prob:.2f})")
+    print(f"[INFO] {msg}")
+    return msg
 
-# ─────────── 6. Ejemplo rápido ───────────────────────────────────────────────
-if __name__=="__main__":
-    ruta = (
-        r"C:\Users\Administrador\Documents\INGENIERIA_EN_SOFTWARE"
-        r"\PROYECTO_FOTOGRAFIAS_ESTUDIANTES\datasets\validated_color\0104651666.jpg"
-    )
-    verificar_presencia_de_lentes(ruta)
+# ─────────── 6. Función para procesar múltiples imágenes en lote ─────────────
+def procesar_lote_imagenes(rutas_imagenes: list, umbral: float = 0.5, 
+                          mostrar_progreso: bool = True) -> dict:
+    """
+    Procesa múltiples imágenes de forma optimizada.
+    Retorna diccionario con rutas como keys y probabilidades como values.
+    """
+    resultados = {}
+    
+    if mostrar_progreso:
+        rutas_imagenes = tqdm.tqdm(rutas_imagenes, desc="Procesando imágenes")
+    
+    for ruta in rutas_imagenes:
+        try:
+            prob = get_glasses_probability(ruta, 0.0)  # umbral mínimo 0 para obtener todas
+            resultados[ruta] = prob
+            if mostrar_progreso:
+                status = "✓ LENTES" if prob >= umbral else "✗ sin lentes"
+                rutas_imagenes.set_postfix_str(f"{status} ({prob:.2f})")
+        except Exception as e:
+            print(f"[ERROR] {ruta}: {e}")
+            resultados[ruta] = 0.0
+    
+    return resultados
+
+# ─────────── 7. Función para limpiar caché manualmente ───────────────────────
+def limpiar_cache_imagenes():
+    """Limpia el caché de imágenes para liberar memoria."""
+    global _image_cache
+    _image_cache.clear()
+    print(f"[INFO] Caché de imágenes limpiado")

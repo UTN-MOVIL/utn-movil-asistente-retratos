@@ -11,7 +11,8 @@ import numpy as np
 # The script expects the model to be in a 'models' subfolder.
 # Download from: http://dlib.net/files/mmod_human_face_detector.dat.bz2
 try:
-    BASE_DIR = Path(__file__).resolve().parent
+    # To this:
+    BASE_DIR = Path(__file__).resolve().parent.parent
 except NameError:
     BASE_DIR = Path.cwd()
 

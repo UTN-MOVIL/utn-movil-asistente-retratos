@@ -31,14 +31,16 @@ from exportacion_datos_excel import (
 )
 
 # ── Constantes Globales ───────────────────────────────────────────────────────
-# <<< NUEVA VARIABLE GLOBAL >>>
-# Umbral de probabilidad para considerar que una imagen tiene lentes.
 UMBRAL_DETECCION_LENTES = 0.4486
 
 # ── Google Drive ──────────────────────────────────────────────────────────────
 SCOPES     = ["https://www.googleapis.com/auth/drive.readonly"]
 TOKEN_FILE = "token.json"
 CREDS_FILE = "credentials.json"
+
+# --- Constantes para el Caché ------------------------------------------------
+# <--- NUEVO: Directorio para almacenar las imágenes y no volver a bajarlas.
+CACHE_DIR = "image_cache"
 
 def drive_service():
     if os.path.exists(TOKEN_FILE):
@@ -89,7 +91,6 @@ def list_files_recursive(folder_id: str, drive) -> List[Tuple[str, str]]:
             break
     return results
 
-# OPTIMIZACIÓN: descarga con chunks grandes
 def download_file_optimized(file_id: str, dest_path: str, drive, chunk_size: int = 10 * 1024 * 1024):
     request = drive.files().get_media(fileId=file_id)
     fh = io.FileIO(dest_path, "wb")
@@ -99,128 +100,122 @@ def download_file_optimized(file_id: str, dest_path: str, drive, chunk_size: int
         _, done = downloader.next_chunk()
     fh.close()
 
-# Worker para descarga en paralelo
-def download_worker(q_in: Queue, q_out: Queue, drive_service_func, temp_dir: str):
-    drive = drive_service_func()
-    while True:
-        item = q_in.get()
-        if item is None:
-            break
-        file_id, name = item
-        local_path = os.path.join(temp_dir, name)
-        try:
-            download_file_optimized(file_id, local_path, drive)
-            q_out.put(('success', local_path))
-        except Exception as e:
-            q_out.put(('error', f"{name}: {e}"))
-        finally:
-            q_in.task_done()
-
-# Función de ayuda: descargas paralelas
 def download_files_parallel(
     files: List[Tuple[str, str]],
-    temp_dir: str,
+    download_dir: str, # <--- Renombrado para mayor claridad
     drive_service_func,
     max_workers: int = 4
 ) -> List[str]:
-    """
-    Downloads files from Google Drive in parallel using a modern thread pool.
-    """
     valid_ext = {'.jpg','.jpeg','.png','.bmp','.tiff','.webp'}
-    valid_files = [
-        (fid, name) for fid, name in files
-        if any(name.lower().endswith(ext) for ext in valid_ext)
-    ]
-    if not valid_files:
-        print("[WARNING] No hay imágenes válidas")
+    # Nota: El filtrado de 'valid_files' ahora se hace en la función principal
+    if not files:
+        print("[WARNING] No hay imágenes válidas para descargar.")
         return []
 
     image_paths = []
     errors = 0
 
-    # This self-contained worker function will be executed by each thread.
-    # It performs a single download task.
     def _download_task(file_id: str, name: str):
-        # Each thread creates its own service client for thread safety.
         drive = drive_service_func()
-        local_path = os.path.join(temp_dir, name)
+        local_path = os.path.join(download_dir, name)
         try:
-            # Re-uses your existing optimized download logic.
             download_file_optimized(file_id, local_path, drive)
             return local_path
         except Exception as e:
-            # Propagate the exception, which the main thread will catch.
-            # This is cleaner than passing error messages through a queue.
             raise RuntimeError(f"Error al descargar '{name}': {e}") from e
 
-    # ThreadPoolExecutor manages the entire lifecycle of the threads.
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        # Submit all download tasks to the pool. `submit` returns a Future object.
         future_to_name = {
             executor.submit(_download_task, fid, name): name
-            for fid, name in valid_files
+            for fid, name in files
         }
 
-        # `as_completed` yields futures as they finish, perfect for a progress bar.
         progress_bar = tqdm(
             concurrent.futures.as_completed(future_to_name),
-            total=len(valid_files),
+            total=len(files),
             desc="Descargando",
             unit="archivo"
         )
 
         for future in progress_bar:
             try:
-                # Get the result from the completed future.
-                # If the task raised an exception, .result() will re-raise it here.
                 path = future.result()
                 image_paths.append(path)
             except Exception as e:
                 print(f"[ERROR] {e}")
                 errors += 1
             
-            # Update the progress bar's postfix with live results.
             progress_bar.set_postfix(exitosos=len(image_paths), errores=errors)
 
     print(f"[INFO] Descarga completa: {len(image_paths)} éxitos, {errors} errores")
     return image_paths
 
-# ── Versión optimizada con descarga paralela ─────────────────────────────────
+# ── Versión optimizada con descarga paralela Y CACHÉ ──────────────────────────
+# <--- FUNCIÓN COMPLETAMENTE ACTUALIZADA
 def process_drive_folder_optimized(
     drive_folder_path: str,
     usar_batch: bool = True,
     umbral_minimo: float = 0.0,
-    max_workers: int = 4
+    max_workers: int = 4,
+    forzar_descarga: bool = False
 ) -> Tuple[List[str], List[float]]:
+    """
+    Procesa imágenes de una carpeta de Drive, usando un caché local para
+    evitar descargas repetidas.
+    """
     print("[INFO] 🚀 Iniciando procesamiento ultra-optimizado...")
     configurar_optimizaciones_gpu()
     warm_up_modelo()
 
     drive = drive_service()
     folder_id = get_folder_id_by_path(drive_folder_path, drive)
-    files = list_files_recursive(folder_id, drive)
-    if not files:
-        print("[ERROR] No se encontraron archivos.")
+    
+    print("[INFO] Obteniendo lista de archivos remotos de Google Drive...")
+    remote_files = list_files_recursive(folder_id, drive)
+    if not remote_files:
+        print("[ERROR] No se encontraron archivos en la carpeta de Drive.")
         return [], []
 
-    print(f"[INFO] Encontrados {len(files)} archivos")
+    print(f"[INFO] Encontrados {len(remote_files)} archivos en Drive.")
+    
+    # --- LÓGICA DE CACHÉ ---
+    image_paths = []
+    os.makedirs(CACHE_DIR, exist_ok=True) 
 
-    temp_dir = tempfile.mkdtemp(prefix="glasses_optimized_")
-    print(f"[INFO] Directorio temporal: {temp_dir}")
+    valid_ext = {'.jpg','.jpeg','.png','.bmp','.tiff','.webp'}
+    remote_image_files = [
+        (fid, name) for fid, name in remote_files 
+        if any(name.lower().endswith(ext) for ext in valid_ext)
+    ]
+    remote_filenames_set = {name for _, name in remote_image_files}
+    local_filenames_set = set(os.listdir(CACHE_DIR))
 
-    # FASE 1: Descarga paralela
-    image_paths = download_files_parallel(files, temp_dir, drive_service, max_workers)
+    if not forzar_descarga and remote_filenames_set == local_filenames_set:
+        print(f"[INFO] ✅ Caché local válido encontrado. Saltando descarga.")
+        image_paths = [os.path.join(CACHE_DIR, name) for name in sorted(list(remote_filenames_set))]
+    
+    else:
+        if forzar_descarga:
+            print("[INFO] ⚠️ Se forzó la descarga. Limpiando caché anterior si es necesario.")
+            for f in os.listdir(CACHE_DIR):
+                os.remove(os.path.join(CACHE_DIR, f))
+        else:
+             print("[INFO] 🔎 Caché local desactualizado o incompleto. Iniciando descarga.")
+        
+        image_paths = download_files_parallel(
+            remote_image_files, CACHE_DIR, drive_service, max_workers
+        )
+
     if not image_paths:
-        print("[WARNING] No se descargaron imágenes válidas")
+        print("[WARNING] No hay imágenes válidas para procesar.")
         return [], []
 
-    print(f"[INFO] ✅ Descargadas {len(image_paths)} imágenes")
+    print(f"[INFO] ✅ Listas {len(image_paths)} imágenes para procesar.")
     print("[INFO] 🔍 Iniciando detección de lentes...")
 
-    # FASE 2: Detección
+    # --- FASE 2: Detección ---
     if usar_batch and len(image_paths) > 1:
         glasses_probs = get_glasses_probability_batch(image_paths, umbral_minimo)
-        # <<< MODIFICADO >>> Se usa la variable global
         pos = sum(1 for p in glasses_probs if p >= UMBRAL_DETECCION_LENTES)
         print(f"[INFO] ✅ Batch completado ({pos}/{len(glasses_probs)} positivos)")
     else:
@@ -232,11 +227,10 @@ def process_drive_folder_optimized(
                 print(f"[ERROR] {path}: {e}")
                 glasses_probs.append(0.0)
 
-    # FASE 3: Estadísticas finales
-    print("[INFO] 📈 Estadísticas finales:")
+    # --- FASE 3: Estadísticas finales ---
+    print("\n[INFO] 📈 Estadísticas finales:")
     obtener_estadisticas_cache()
     total = len(glasses_probs)
-    # <<< MODIFICADO >>> Se usa la variable global
     con_lentes = sum(1 for p in glasses_probs if p >= UMBRAL_DETECCION_LENTES)
     sin_lentes = total - con_lentes
     prom = sum(glasses_probs) / total if total else 0
@@ -260,13 +254,16 @@ if __name__ == "__main__":
     USAR_BATCH = True
     UMBRAL_MIN = 0.0
     MAX_THREADS = 6
+    # <--- NUEVO: Parámetro para forzar la descarga
+    FORZAR_NUEVA_DESCARGA = False
 
     try:
         paths, probs = process_drive_folder_optimized(
             dataset_drive_path,
             usar_batch=USAR_BATCH,
             umbral_minimo=UMBRAL_MIN,
-            max_workers=MAX_THREADS
+            max_workers=MAX_THREADS,
+            forzar_descarga=FORZAR_NUEVA_DESCARGA # <--- Uso del nuevo parámetro
         )
         if not paths:
             sys.exit(1)
@@ -274,7 +271,6 @@ if __name__ == "__main__":
         info = {
             "Rutas": format_to_hyperlinks(paths),
             "Probabilidad": probs,
-            # <<< MODIFICADO >>> Se usa la variable global
             "Detección": ["SÍ" if p >= UMBRAL_DETECCION_LENTES else "NO" for p in probs]
         }
         normalized = normalize_dict_lengths(info)
@@ -287,7 +283,10 @@ if __name__ == "__main__":
         print("\n[INFO] Interrumpido por usuario")
         limpiar_cache_imagenes()
         sys.exit(0)
+    except FileNotFoundError as e:
+        print(f"\n[ERROR DE RUTA] No se pudo encontrar una carpeta en Google Drive: {e}")
+        sys.exit(1)
     except Exception as e:
-        print(f"\n[ERROR] {e}")
+        print(f"\n[ERROR INESPERADO] {e}")
         limpiar_cache_imagenes()
         sys.exit(1)

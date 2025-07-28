@@ -96,17 +96,20 @@ def check_dlib_gpu_compatibility():
         print(f"   Argumentos del Error: {e.args}")
         print(f"   Mensaje: {e}")
 
-        print("\n--- Causa Original (Excepción Encadenada) ---")
-        print(f"   Tipo: {type(e.__cause__).__name__}")
-        print(f"   Mensaje: {e.__cause__}")
-        print("   Traceback de la Causa:")
-        traceback.print_tb(e.__cause__.__traceback__)
+        # Check for and print chained exceptions, which often reveal the root cause
+        if e.__cause__:
+            print("\n--- Causa Original (Excepción Encadenada) ---")
+            print(f"   Tipo: {type(e.__cause__).__name__}")
+            print(f"   Mensaje: {e.__cause__}")
+            print("   Traceback de la Causa:")
+            traceback.print_tb(e.__cause__.__traceback__)
         
-        print("\n--- Contexto de la Excepción (Implícito) ---")
-        print(f"   Tipo: {type(e.__context__).__name__}")
-        print(f"   Mensaje: {e.__context__}")
-        print("   Traceback del Contexto:")
-        traceback.print_tb(e.__context__.__traceback__)
+        if e.__context__ and not e.__suppress_context__:
+             print("\n--- Contexto de la Excepción (Implícito) ---")
+             print(f"   Tipo: {type(e.__context__).__name__}")
+             print(f"   Mensaje: {e.__context__}")
+             print("   Traceback del Contexto:")
+             traceback.print_tb(e.__context__.__traceback__)
 
         print("\n--- Traceback Completo del Error Actual ---")
         traceback.print_exc(file=sys.stdout)

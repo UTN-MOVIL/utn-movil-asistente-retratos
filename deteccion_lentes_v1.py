@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Detección de lentes en imágenes usando Autodistill + Detic (OPTIMIZADO).
+Detección de lentes en imágenes usando Autodistill + Detic (versión optimizada).
 
 Requisitos:
     pip install autodistill-detic supervision opencv-python torch torchvision tqdm
@@ -10,21 +10,21 @@ from __future__ import annotations
 
 import os
 import sys
-import urllib.request
 import shutil
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Iterable, Dict, List
+from typing import Dict, Iterable, List
 
 import cv2
 import numpy as np
+import supervision as sv
 import torch
 import tqdm
-import supervision as sv
-from autodistill_detic import DETIC
 from autodistill.detection import CaptionOntology
+from autodistill_detic import DETIC
 
-
-# ─────────────────────────── 1. Pesos ──────────────────────────────────────────
+# ─────────────────────────── 1. Pesos ─────────────────────────────────────────
 WEIGHTS_NAME = "Detic_LCOCOI21k_CLIP_SwinB_896b32_4x_ft4x_max-size.pth"
 WEIGHTS_URL = f"https://dl.fbaipublicfiles.com/detic/{WEIGHTS_NAME}"
 CACHE_DIR = Path.home() / ".cache" / "autodistill" / "Detic" / "models"
@@ -43,7 +43,7 @@ if not WEIGHTS_LOCAL.exists():
 else:
     print(f"[INFO] ✅  Pesos ya presentes en {WEIGHTS_LOCAL}")
 
-# ───────────────────── 2. Rutas / YAML de Detic ───────────────────────────────
+# ───────────────────── 2. Rutas / YAML de Detic ──────────────────────────────
 detic_root = Path(__file__).parent / "Detic"
 cfg_file = detic_root / "configs" / WEIGHTS_NAME.replace(".pth", ".yaml")
 print(f"[INFO] Detic root    : {detic_root} | existe → {detic_root.is_dir()}")
@@ -64,47 +64,48 @@ else:
 
 print(f"[INFO] Directorio de trabajo actual → {Path.cwd()}")
 
-# ────────────────── 3. Construcción del modelo Detic ──────────────────────────
+# ──────────────── 3. Construcción y optimización del modelo ──────────────────
 ontology = CaptionOntology({"eyeglasses": "eyeglasses"})
 print("[INFO] Creando modelo DETIC …")
 detic_model = DETIC(ontology=ontology)
+
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[INFO] Modelo listo en {device}")
 
-if torch.cuda.is_available():
+if device == "cuda":
+    detic_model.model.half()                       # pesos en FP16
+    detic_model.model = torch.compile(detic_model.model)  # torch-compile
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
-    print("[INFO] Optimizaciones CUDA activadas")
+    print("[INFO] Optimizaciones CUDA + FP16 activadas")
 
-# ───────────────────────────── CACHÉS ─────────────────────────────────────────
+# ───────────────────────────── CACHÉS ────────────────────────────────────────
 _image_cache: Dict[str, np.ndarray] = {}
 _preprocessed_cache: Dict[str, np.ndarray] = {}
 _result_cache: Dict[str, float] = {}
 MAX_CACHE_SIZE = 100
 
-
-# ─────────────────────── utilidades internas ─────────────────────────────────
-def _get_image_hash(ruta_imagen: str) -> str:
+# ─────────────────────── utilidades internas ────────────────────────────────
+def _get_image_hash(path: str) -> str:
     try:
-        st = os.stat(ruta_imagen)
-        return f"{ruta_imagen}_{st.st_mtime}_{st.st_size}"
+        st = os.stat(path)
+        return f"{path}_{st.st_mtime}_{st.st_size}"
     except FileNotFoundError:
-        return ruta_imagen
+        return path
 
 
-def _load_image_optimized(ruta_imagen: str) -> np.ndarray:
-    img_hash = _get_image_hash(ruta_imagen)
-    # limpia parte del caché cuando crece demasiado
+def _load_image_optimized(path: str) -> np.ndarray:
+    img_hash = _get_image_hash(path)
     if len(_image_cache) > MAX_CACHE_SIZE:
         for key in list(_image_cache)[: MAX_CACHE_SIZE // 5]:
             _image_cache.pop(key)
 
     if img_hash not in _image_cache:
-        if not os.path.exists(ruta_imagen):
-            raise FileNotFoundError(f"Imagen no encontrada: {ruta_imagen}")
-        img = cv2.imread(ruta_imagen)
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Imagen no encontrada: {path}")
+        img = cv2.imread(path)
         if img is None:
-            raise ValueError(f"No se pudo cargar la imagen: {ruta_imagen}")
+            raise ValueError(f"No se pudo cargar la imagen: {path}")
 
         h, w = img.shape[:2]
         target = 640
@@ -113,42 +114,36 @@ def _load_image_optimized(ruta_imagen: str) -> np.ndarray:
             img = cv2.resize(
                 img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR
             )
-            print(f"[INFO] Redimensionada {ruta_imagen} a ≤{target}px")
+            print(f"[INFO] Redimensionada {path} a ≤{target}px")
 
         _image_cache[img_hash] = img
 
     return _image_cache[img_hash]
 
 
-# ──────────────────────────── API (uno-por-uno) ──────────────────────────────
+# ───────────────────────────── API (uno-por-uno) ─────────────────────────────
 @torch.inference_mode()
-def get_glasses_probability(ruta_imagen: str, umbral_min: float = 0.0) -> float:
-    img_hash = _get_image_hash(ruta_imagen)
+def get_glasses_probability(path: str, umbral_min: float = 0.0) -> float:
+    img_hash = _get_image_hash(path)
     cache_key = f"{img_hash}_{umbral_min}"
     if cache_key in _result_cache:
         return _result_cache[cache_key]
 
-    # carga + preprocesamiento
     if img_hash in _preprocessed_cache:
         img = _preprocessed_cache[img_hash]
     else:
-        img = _load_image_optimized(ruta_imagen)
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)  # seguro que ya es RGB
+        img = _load_image_optimized(path)
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         _preprocessed_cache[img_hash] = img
         if len(_preprocessed_cache) > MAX_CACHE_SIZE:
             for k in list(_preprocessed_cache)[: MAX_CACHE_SIZE // 5]:
                 _preprocessed_cache.pop(k)
 
-    # inferencia
-    with torch.cuda.amp.autocast(enabled=torch.cuda.is_available()):
+    with torch.cuda.amp.autocast(enabled=(device == "cuda")):
         dets: sv.Detections = detic_model.predict(img)
 
     confs = np.asarray(dets.confidence)
-    if confs.size == 0:
-        result = 0.0
-    else:
-        valid = confs[confs >= umbral_min]
-        result = float(valid.max()) if valid.size else 0.0
+    result = float(confs[confs >= umbral_min].max()) if confs.size else 0.0
 
     _result_cache[cache_key] = result
     if len(_result_cache) > MAX_CACHE_SIZE * 2:
@@ -158,42 +153,50 @@ def get_glasses_probability(ruta_imagen: str, umbral_min: float = 0.0) -> float:
     return result
 
 
-# ───────────────────────────── API (batch) ────────────────────────────────────
+# ───────────────────────────── API (batch) ───────────────────────────────────
+def _load_and_rgb(path: str) -> np.ndarray:
+    img = _load_image_optimized(path)
+    return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+
 def get_glasses_probability_batch(
-    rutas_imagenes: Iterable[str], umbral_min: float = 0.0
+    paths: Iterable[str], umbral_min: float = 0.0
 ) -> List[float]:
-    rutas = list(rutas_imagenes)
-    resultados: List[float] = [0.0] * len(rutas)
+    rutas = list(paths)
+    resultados = [0.0] * len(rutas)
 
-    batch_imgs, idxs = [], []
-    for i, ruta in enumerate(rutas):
-        try:
-            img = _load_image_optimized(ruta)
-            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            batch_imgs.append(img)
-            idxs.append(i)
-        except Exception as e:
-            print(f"[ERROR] No se pudo cargar {ruta}: {e}")
+    with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
+        imgs = list(pool.map(_load_and_rgb, rutas))
 
-    if not batch_imgs:
-        return resultados
+    inputs = [
+        {
+            "image": torch.from_numpy(img)
+            .permute(2, 0, 1)
+            .to(device)
+            .half()
+            if device == "cuda"
+            else torch.from_numpy(img).permute(2, 0, 1),
+            "height": img.shape[0],
+            "width": img.shape[1],
+        }
+        for img in imgs
+    ]
 
-    with torch.inference_mode(), torch.cuda.amp.autocast(
-        enabled=torch.cuda.is_available()
-    ):
-        for j, img in enumerate(batch_imgs):
-            dets: sv.Detections = detic_model.predict(img)
-            confs = np.asarray(dets.confidence)
-            if confs.size:
-                valid = confs[confs >= umbral_min]
-                resultados[idxs[j]] = float(valid.max()) if valid.size else 0.0
+    with torch.inference_mode(), torch.cuda.amp.autocast(enabled=(device == "cuda")):
+        outputs = detic_model.model(inputs)
+
+    for i, out in enumerate(outputs):
+        confs = out["instances"].scores.cpu().numpy()
+        if confs.size:
+            valid = confs[confs >= umbral_min]
+            resultados[i] = float(valid.max()) if valid.size else 0.0
 
     return resultados
 
 
-# ──────────────────────── Helpers de alto nivel ──────────────────────────────
-def verificar_presencia_de_lentes(ruta_imagen: str, umbral: float = 0.45) -> str:
-    prob = get_glasses_probability(ruta_imagen, umbral)
+# ─────────────────────── Helpers de alto nivel ───────────────────────────────
+def verificar_presencia_de_lentes(path: str, umbral: float = 0.45) -> str:
+    prob = get_glasses_probability(path, umbral)
     msg = (
         f"Imagen contiene lentes (prob.≈{prob:.2f})"
         if prob >= umbral
@@ -204,49 +207,48 @@ def verificar_presencia_de_lentes(ruta_imagen: str, umbral: float = 0.45) -> str
 
 
 def procesar_lote_imagenes(
-    rutas_imagenes: Iterable[str],
+    rutas: Iterable[str],
     umbral: float = 0.45,
     mostrar_progreso: bool = True,
     usar_batch: bool = True,
 ) -> Dict[str, float]:
-    rutas = list(rutas_imagenes)
+    rutas = list(rutas)
 
-    # ——— batch ———
     if usar_batch:
         probs = get_glasses_probability_batch(rutas, umbral)
         resultados = dict(zip(rutas, probs))
         if mostrar_progreso:
-            for ruta, p in resultados.items():
+            for pth, p in resultados.items():
                 estado = "✓ LENTES" if p >= umbral else "✗ sin lentes"
-                print(f"[INFO] {ruta}: {estado} ({p:.2f})")
+                print(f"[INFO] {pth}: {estado} ({p:.2f})")
         return resultados
 
-    # ——— uno-por-uno ———
     resultados: Dict[str, float] = {}
 
     if mostrar_progreso:
-        bar = tqdm.tqdm(rutas, desc="Imágenes")
-        for ruta in bar:
+        barra = tqdm.tqdm(rutas, desc="Imágenes")
+        for pth in barra:
             try:
-                prob = get_glasses_probability(ruta, umbral)
-                resultados[ruta] = prob
+                prob = get_glasses_probability(pth, umbral)
+                resultados[pth] = prob
                 estado = "✓ LENTES" if prob >= umbral else "✗ sin lentes"
-                bar.set_postfix_str(f"{estado} ({prob:.2f})")
+                barra.set_postfix({"estado": f"{estado} ({prob:.2f})"})
             except Exception as e:
-                print(f"[ERROR] {ruta}: {e}")
-                resultados[ruta] = 0.0
+                print(f"[ERROR] {pth}: {e}")
+                resultados[pth] = 0.0
     else:
-        for ruta in rutas:
+        for pth in rutas:
             try:
-                resultados[ruta] = get_glasses_probability(ruta, umbral)
+                prob = get_glasses_probability(pth, umbral)
+                resultados[pth] = prob
             except Exception as e:
-                print(f"[ERROR] {ruta}: {e}")
-                resultados[ruta] = 0.0
+                print(f"[ERROR] {pth}: {e}")
+                resultados[pth] = 0.0
 
     return resultados
 
 
-# ────────────────────────── utilidades varias ────────────────────────────────
+# ───────────────────────── utilidades varias ────────────────────────────────
 def limpiar_cache_imagenes():
     _image_cache.clear()
     _preprocessed_cache.clear()
@@ -269,7 +271,7 @@ def obtener_estadisticas_cache():
 
 
 def configurar_optimizaciones_gpu():
-    if torch.cuda.is_available():
+    if device == "cuda":
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cuda.matmul.allow_tf32 = True
         dummy = np.zeros((480, 640, 3), dtype=np.uint8)
@@ -289,7 +291,7 @@ def warm_up_modelo(iters: int = 3):
     print("[INFO] Modelo pre-calentado")
 
 
-# ────────────────────────────── CLI simple ───────────────────────────────────
+# ───────────────────────────── CLI simple ────────────────────────────────────
 if __name__ == "__main__":
     configurar_optimizaciones_gpu()
     warm_up_modelo()

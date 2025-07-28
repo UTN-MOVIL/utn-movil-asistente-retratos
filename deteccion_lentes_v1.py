@@ -160,11 +160,12 @@ def get_glasses_probability(ruta_imagen: str, umbral_min: float = 0.0) -> float:
 
 # ───────────────────────────── API (batch) ────────────────────────────────────
 def get_glasses_probability_batch(
-    rutas_imagenes: Iterable[str], umbral_min: float = 0.0
+    rutas_imagenes: Iterable[str], umbral_min: float = 0.0, batch_size: int = 8
 ) -> List[float]:
     rutas = list(rutas_imagenes)
     resultados: List[float] = [0.0] * len(rutas)
 
+    # Load all images first with better error handling
     batch_imgs, idxs = [], []
     for i, ruta in enumerate(rutas):
         try:
@@ -181,15 +182,33 @@ def get_glasses_probability_batch(
     with torch.inference_mode(), torch.cuda.amp.autocast(
         enabled=torch.cuda.is_available()
     ):
-        for j, img in enumerate(batch_imgs):
-            dets: sv.Detections = detic_model.predict(img)
-            confs = np.asarray(dets.confidence)
-            if confs.size:
-                valid = confs[confs >= umbral_min]
-                resultados[idxs[j]] = float(valid.max()) if valid.size else 0.0
+        # Process in batches instead of one by one
+        for batch_start in range(0, len(batch_imgs), batch_size):
+            batch_end = min(batch_start + batch_size, len(batch_imgs))
+            current_batch = batch_imgs[batch_start:batch_end]
+            current_idxs = idxs[batch_start:batch_end]
+            
+            # Check if your model supports batch prediction
+            if hasattr(detic_model, 'predict_batch'):
+                # Use batch prediction if available
+                batch_dets = detic_model.predict_batch(current_batch)
+                for j, dets in enumerate(batch_dets):
+                    confs = np.asarray(dets.confidence)
+                    if confs.size:
+                        valid = confs[confs >= umbral_min]
+                        resultados[current_idxs[j]] = float(valid.max()) if valid.size else 0.0
+            else:
+                # Fallback to individual processing but in smaller batches
+                for j, img in enumerate(current_batch):
+                    dets: sv.Detections = detic_model.predict(img)
+                    confs = np.asarray(dets.confidence)
+                    if confs.size:
+                        # Vectorized operations
+                        valid_mask = confs >= umbral_min
+                        if valid_mask.any():
+                            resultados[current_idxs[j]] = float(confs[valid_mask].max())
 
     return resultados
-
 
 # ──────────────────────── Helpers de alto nivel ──────────────────────────────
 def verificar_presencia_de_lentes(ruta_imagen: str, umbral: float = 0.45) -> str:

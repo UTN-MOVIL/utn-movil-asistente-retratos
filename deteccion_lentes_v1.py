@@ -167,31 +167,29 @@ def get_glasses_probability_batch(
     rutas = list(paths)
     resultados = [0.0] * len(rutas)
 
+    # Load images in parallel
     with ThreadPoolExecutor(max_workers=os.cpu_count()) as pool:
         imgs = list(pool.map(_load_and_rgb, rutas))
 
-    inputs = [
-        {
-            "image": torch.from_numpy(img)
-            .permute(2, 0, 1)
-            .to(device)
-            .half()
-            if device == "cuda"
-            else torch.from_numpy(img).permute(2, 0, 1),
-            "height": img.shape[0],
-            "width": img.shape[1],
-        }
-        for img in imgs
-    ]
-
+    # Access the underlying detectron2 predictor
+    predictor = detic_model.detic_model.predictor
+    
     with torch.inference_mode(), torch.cuda.amp.autocast(enabled=(device == "cuda")):
-        outputs = detic_model.detic_model(inputs)
-
-    for i, out in enumerate(outputs):
-        confs = out["instances"].scores.cpu().numpy()
-        if confs.size:
-            valid = confs[confs >= umbral_min]
-            resultados[i] = float(valid.max()) if valid.size else 0.0
+        for i, img in enumerate(imgs):
+            try:
+                # Use detectron2's predictor directly
+                outputs = predictor(img)
+                
+                # Extract confidence scores
+                if "instances" in outputs:
+                    instances = outputs["instances"]
+                    if len(instances) > 0:
+                        confs = instances.scores.cpu().numpy()
+                        valid = confs[confs >= umbral_min]
+                        resultados[i] = float(valid.max()) if valid.size else 0.0
+            except Exception as e:
+                print(f"[ERROR] Processing image {rutas[i]}: {e}")
+                resultados[i] = 0.0
 
     return resultados
 

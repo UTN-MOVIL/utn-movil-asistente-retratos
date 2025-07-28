@@ -24,7 +24,7 @@ except NameError:
 
 MODELS_DIR = BASE_DIR / "models"
 CNN_FACE_DETECTOR_PATH = MODELS_DIR / "mmod_human_face_detector.dat"
-IMAGE_PATH = BASE_DIR / "test_image.jpg" # 👈 Place a test image here!
+IMAGE_PATH = "test_image.jpg" # 👈 Place a test image here!
 
 # --- Main Logic ---
 def run_dlib_pytorch_inference():

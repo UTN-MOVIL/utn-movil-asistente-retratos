@@ -24,7 +24,7 @@ import tqdm
 from autodistill.detection import CaptionOntology
 from autodistill_detic import DETIC
 
-# ─────────────────────────── 1. Pesos ─────────────────────────────────────────
+# ───────────────────────────── 1. Pesos ──────────────────────────────────────
 WEIGHTS_NAME = "Detic_LCOCOI21k_CLIP_SwinB_896b32_4x_ft4x_max-size.pth"
 WEIGHTS_URL = f"https://dl.fbaipublicfiles.com/detic/{WEIGHTS_NAME}"
 CACHE_DIR = Path.home() / ".cache" / "autodistill" / "Detic" / "models"
@@ -43,7 +43,7 @@ if not WEIGHTS_LOCAL.exists():
 else:
     print(f"[INFO] ✅  Pesos ya presentes en {WEIGHTS_LOCAL}")
 
-# ───────────────────── 2. Rutas / YAML de Detic ──────────────────────────────
+# ────────────────────── 2. Rutas / YAML de Detic ────────────────────────────
 detic_root = Path(__file__).parent / "Detic"
 cfg_file = detic_root / "configs" / WEIGHTS_NAME.replace(".pth", ".yaml")
 print(f"[INFO] Detic root    : {detic_root} | existe → {detic_root.is_dir()}")
@@ -64,22 +64,22 @@ else:
 
 print(f"[INFO] Directorio de trabajo actual → {Path.cwd()}")
 
-# ──────────────── 3. Construcción y optimización del modelo ──────────────────
+# ───────────── 3. Construcción y optimización del modelo ────────────────────
 ontology = CaptionOntology({"eyeglasses": "eyeglasses"})
 print("[INFO] Creando modelo DETIC …")
-detic_model = DETIC(ontology=ontology)
+detic_model = DETIC(ontology=ontology)                   # wrapper
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[INFO] Modelo listo en {device}")
 
 if device == "cuda":
-    detic_model.model.half()                       # pesos en FP16
-    detic_model.model = torch.compile(detic_model.model)  # torch-compile
+    detic_model.detic_model.half()                       # FP16
+    detic_model.detic_model = torch.compile(detic_model.detic_model)
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
     print("[INFO] Optimizaciones CUDA + FP16 activadas")
 
-# ───────────────────────────── CACHÉS ────────────────────────────────────────
+# ───────────────────────────── CACHÉS ───────────────────────────────────────
 _image_cache: Dict[str, np.ndarray] = {}
 _preprocessed_cache: Dict[str, np.ndarray] = {}
 _result_cache: Dict[str, float] = {}
@@ -97,8 +97,8 @@ def _get_image_hash(path: str) -> str:
 def _load_image_optimized(path: str) -> np.ndarray:
     img_hash = _get_image_hash(path)
     if len(_image_cache) > MAX_CACHE_SIZE:
-        for key in list(_image_cache)[: MAX_CACHE_SIZE // 5]:
-            _image_cache.pop(key)
+        for k in list(_image_cache)[: MAX_CACHE_SIZE // 5]:
+            _image_cache.pop(k)
 
     if img_hash not in _image_cache:
         if not os.path.exists(path):
@@ -120,8 +120,7 @@ def _load_image_optimized(path: str) -> np.ndarray:
 
     return _image_cache[img_hash]
 
-
-# ───────────────────────────── API (uno-por-uno) ─────────────────────────────
+# ──────────────────────────── API (uno-por-uno) ─────────────────────────────
 @torch.inference_mode()
 def get_glasses_probability(path: str, umbral_min: float = 0.0) -> float:
     img_hash = _get_image_hash(path)
@@ -152,12 +151,10 @@ def get_glasses_probability(path: str, umbral_min: float = 0.0) -> float:
 
     return result
 
-
-# ───────────────────────────── API (batch) ───────────────────────────────────
+# ───────────────────────────── API (batch) ──────────────────────────────────
 def _load_and_rgb(path: str) -> np.ndarray:
     img = _load_image_optimized(path)
     return cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
 
 def get_glasses_probability_batch(
     paths: Iterable[str], umbral_min: float = 0.0
@@ -183,7 +180,7 @@ def get_glasses_probability_batch(
     ]
 
     with torch.inference_mode(), torch.cuda.amp.autocast(enabled=(device == "cuda")):
-        outputs = detic_model.model(inputs)
+        outputs = detic_model.detic_model(inputs)
 
     for i, out in enumerate(outputs):
         confs = out["instances"].scores.cpu().numpy()
@@ -193,14 +190,13 @@ def get_glasses_probability_batch(
 
     return resultados
 
-
-# ─────────────────────── Helpers de alto nivel ───────────────────────────────
+# ─────────────────────── Helpers de alto nivel ──────────────────────────────
 def verificar_presencia_de_lentes(path: str, umbral: float = 0.45) -> str:
     prob = get_glasses_probability(path, umbral)
     msg = (
-        f"Imagen contiene lentes (prob.≈{prob:.2f})"
+        f"Imagen contiene lentes (prob≈{prob:.2f})"
         if prob >= umbral
-        else f"Imagen NO contiene lentes (prob.≈{prob:.2f})"
+        else f"Imagen NO contiene lentes (prob≈{prob:.2f})"
     )
     print(f"[INFO] {msg}")
     return msg
@@ -226,27 +222,25 @@ def procesar_lote_imagenes(
     resultados: Dict[str, float] = {}
 
     if mostrar_progreso:
-        barra = tqdm.tqdm(rutas, desc="Imágenes")
-        for pth in barra:
+        bar = tqdm.tqdm(rutas, desc="Imágenes")
+        for pth in bar:
             try:
                 prob = get_glasses_probability(pth, umbral)
                 resultados[pth] = prob
                 estado = "✓ LENTES" if prob >= umbral else "✗ sin lentes"
-                barra.set_postfix({"estado": f"{estado} ({prob:.2f})"})
+                bar.set_postfix({"estado": f"{estado} ({prob:.2f})"})
             except Exception as e:
                 print(f"[ERROR] {pth}: {e}")
                 resultados[pth] = 0.0
     else:
         for pth in rutas:
             try:
-                prob = get_glasses_probability(pth, umbral)
-                resultados[pth] = prob
+                resultados[pth] = get_glasses_probability(pth, umbral)
             except Exception as e:
                 print(f"[ERROR] {pth}: {e}")
                 resultados[pth] = 0.0
 
     return resultados
-
 
 # ───────────────────────── utilidades varias ────────────────────────────────
 def limpiar_cache_imagenes():
@@ -290,8 +284,7 @@ def warm_up_modelo(iters: int = 3):
         detic_model.predict(dummy)
     print("[INFO] Modelo pre-calentado")
 
-
-# ───────────────────────────── CLI simple ────────────────────────────────────
+# ───────────────────────────── CLI simple ───────────────────────────────────
 if __name__ == "__main__":
     configurar_optimizaciones_gpu()
     warm_up_modelo()

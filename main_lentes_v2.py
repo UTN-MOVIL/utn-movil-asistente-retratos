@@ -215,7 +215,7 @@ def process_drive_folder_optimized(
 
     # --- FASE 2: Detección ---
     if usar_batch and len(image_paths) > 1:
-        glasses_probs = get_glasses_probability_batch(image_paths, umbral_minimo)
+        glasses_probs = get_glasses_probability_batch(image_paths)
         pos = sum(1 for p in glasses_probs if p >= UMBRAL_DETECCION_LENTES)
         print(f"[INFO] ✅ Batch completado ({pos}/{len(glasses_probs)} positivos)")
     else:

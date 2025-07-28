@@ -49,7 +49,7 @@ def descargar_train(dest: str = DESTDIR) -> str:
         force=True,
     )
 
-    train_dir = os.path.join(dest, "train")
+    train_dir = os.path.join(dest, "val")
     if not os.path.isdir(train_dir):
         raise FileNotFoundError("No se encontró la carpeta 'train/' tras descomprimir.")
     return train_dir

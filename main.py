@@ -1,60 +1,53 @@
 #!/usr/bin/env python3
 """
-Descarga únicamente `train.zip` del dataset
+Descarga el dataset *completo* de Kaggle
     sehriyarmemmedli/glasses-vs-noglasses-dataset
-usando un kaggle.json que está **en la misma carpeta que este script**.
-Después evalúa la accuracy de tu detector de gafas.
+(lo descomprime automáticamente) y luego evalúa la accuracy
+de tu detector de gafas sobre las imágenes de train/.
 
 Estructura esperada
 └── proyecto/
-    ├── kaggle.json          ← tu credencial
-    ├── deteccion_lentes_v1.py
-    └── download_and_eval.py ← (este archivo)
+    ├── kaggle.json              ← tu credencial
+    ├── deteccion_lentes_v1.py    ← tu modelo
+    └── download_and_eval.py      ← este archivo
 
-Prerrequisitos
---------------
+Requisitos
+----------
 pip install kaggle tqdm numpy
 """
 
 import os
-import zipfile
 import glob
 import pathlib
 import numpy as np
 from tqdm import tqdm
 
-# 1️⃣  Configurar dónde está kaggle.json  ──────────────────────────────────────
-import os, pathlib                      # noqa: E402
+# 1️⃣  Configurar la ruta a kaggle.json
 os.environ["KAGGLE_CONFIG_DIR"] = str(pathlib.Path(__file__).parent)
 
 from kaggle.api.kaggle_api_extended import KaggleApi  # noqa: E402
-
-# 2️⃣  Tu modelo ---------------------------------------------------------------
 from deteccion_lentes_v1 import get_glasses_probability_batch  # noqa: E402
 
 # ── Parámetros del script ────────────────────────────────────────────────────
 DATASET = "sehriyarmemmedli/glasses-vs-noglasses-dataset"
-ZIPFILE = "train.zip"           # sólo este fichero
-DESTDIR = "data"                # carpeta destino
-UMBRAL  = 0.5                   # ≥ UMBRAL ⇒ “con gafas”
-BATCH   = 64                    # tamaño batch para inferencia
+DESTDIR = "data"
+UMBRAL  = 0.5     # ≥ UMBRAL ⇒ “con gafas”
+BATCH   = 64      # tamaño de batch para inferencia
 
 
 def descargar_train(dest: str = DESTDIR) -> str:
-    """Autentica y descarga train.zip, devolviendo la ruta a data/train/."""
+    """Autentica, descarga y descomprime todo el dataset. Devuelve data/train/."""
     api = KaggleApi()
     api.authenticate()
 
-    os.makedirs(dest, exist_ok=True)
-    api.dataset_download_file(
-        DATASET, file_name=ZIPFILE, path=dest, force=True, quiet=False
+    print("[INFO] Descargando y descomprimiendo dataset completo…")
+    api.dataset_download_files(
+        DATASET,
+        path=dest,
+        unzip=True,
+        quiet=False,
+        force=True,
     )
-
-    zip_path = os.path.join(dest, ZIPFILE)
-    print(f"[INFO] Descomprimiendo {zip_path} …")
-    with zipfile.ZipFile(zip_path, "r") as z:
-        z.extractall(dest)
-    os.remove(zip_path)
 
     train_dir = os.path.join(dest, "train")
     if not os.path.isdir(train_dir):
@@ -64,7 +57,7 @@ def descargar_train(dest: str = DESTDIR) -> str:
 
 def evaluar(train_root: str) -> float:
     """Evalúa accuracy usando tu modelo de probabilidad de gafas."""
-    with_glasses   = sorted(glob.glob(os.path.join(train_root, "with_glasses", "*")))
+    with_glasses    = sorted(glob.glob(os.path.join(train_root, "with_glasses", "*")))
     without_glasses = sorted(glob.glob(os.path.join(train_root, "without_glasses", "*")))
 
     rutas   = with_glasses + without_glasses

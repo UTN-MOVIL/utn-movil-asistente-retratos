@@ -89,32 +89,97 @@ def check_dlib_gpu_compatibility():
 
     except RuntimeError as e:
         print(f"\n❌ FALLO: Ocurrió un error en tiempo de ejecución al usar el modelo en la GPU.")
-        print("\n" + "="*20 + " ANÁLISIS DEL ERROR " + "="*20)
+        print("\n" + "="*20 + " ANÁLISIS COMPLETO DEL ERROR " + "="*20)
         
         print("\n--- Detalles Principales ---")
         print(f"   Tipo de Error: {type(e).__name__}")
+        print(f"   Módulo del Error: {type(e).__module__}")
         print(f"   Argumentos del Error: {e.args}")
-        print(f"   Mensaje: {e}")
-
-        # Check for and print chained exceptions, which often reveal the root cause
-        if e.__cause__:
-            print("\n--- Causa Original (Excepción Encadenada) ---")
-            print(f"   Tipo: {type(e.__cause__).__name__}")
-            print(f"   Mensaje: {e.__cause__}")
-            print("   Traceback de la Causa:")
-            traceback.print_tb(e.__cause__.__traceback__)
+        print(f"   Mensaje Principal: {str(e)}")
+        print(f"   Representación Completa: {repr(e)}")
         
-        if e.__context__ and not e.__suppress_context__:
-             print("\n--- Contexto de la Excepción (Implícito) ---")
-             print(f"   Tipo: {type(e.__context__).__name__}")
-             print(f"   Mensaje: {e.__context__}")
-             print("   Traceback del Contexto:")
-             traceback.print_tb(e.__context__.__traceback__)
-
-        print("\n--- Traceback Completo del Error Actual ---")
-        traceback.print_exc(file=sys.stdout)
+        # Print error attributes if they exist
+        print("\n--- Atributos del Error ---")
+        error_attrs = [attr for attr in dir(e) if not attr.startswith('_')]
+        if error_attrs:
+            for attr in error_attrs:
+                try:
+                    value = getattr(e, attr)
+                    if not callable(value):  # Skip methods
+                        print(f"   {attr}: {value}")
+                except:
+                    print(f"   {attr}: <no se pudo acceder>")
+        else:
+            print("   No hay atributos adicionales disponibles.")
         
-        print("\n" + "="*62)
+        # Print the full traceback with more details
+        print("\n--- Traceback Completo del Error ---")
+        import traceback
+        tb_lines = traceback.format_exception(type(e), e, e.__traceback__)
+        for line in tb_lines:
+            print(f"   {line.rstrip()}")
+        
+        # Print local variables at the point of error (if traceback exists)
+        print("\n--- Variables Locales en el Punto del Error ---")
+        if e.__traceback__:
+            tb = e.__traceback__
+            while tb.tb_next:  # Go to the innermost frame
+                tb = tb.tb_next
+            
+            local_vars = tb.tb_frame.f_locals
+            if local_vars:
+                for var_name, var_value in local_vars.items():
+                    try:
+                        # Avoid printing very large objects
+                        str_value = str(var_value)
+                        if len(str_value) > 200:
+                            str_value = str_value[:200] + "... (truncado)"
+                        print(f"   {var_name}: {str_value}")
+                    except:
+                        print(f"   {var_name}: <no se pudo convertir a string>")
+            else:
+                print("   No hay variables locales disponibles.")
+        
+        # Additional GPU/CUDA specific diagnostics
+        print("\n--- Diagnósticos Adicionales de GPU/CUDA ---")
+        try:
+            print(f"   Número de dispositivos CUDA detectados: {dlib.cuda.get_num_devices()}")
+        except:
+            print("   No se pudo obtener información de dispositivos CUDA")
+        
+        try:
+            print(f"   dlib.DLIB_USE_CUDA: {dlib.DLIB_USE_CUDA}")
+        except:
+            print("   No se pudo verificar el estado de CUDA en dlib")
+        
+        # Try to get CUDA/GPU memory info if available
+        try:
+            import subprocess
+            result = subprocess.run(['nvidia-smi', '--query-gpu=memory.used,memory.total', '--format=csv,noheader,nounits'], 
+                                  capture_output=True, text=True, timeout=5)
+            if result.returncode == 0:
+                print(f"   Memoria GPU (nvidia-smi): {result.stdout.strip()}")
+        except:
+            print("   No se pudo obtener información de memoria GPU")
+        
+        print("\n" + "="*72)
+        
+        # Optional: Save error details to a file
+        try:
+            error_log_path = Path("dlib_error_log.txt")
+            with open(error_log_path, "w", encoding="utf-8") as f:
+                f.write("DLIB GPU ERROR LOG\n")
+                f.write("="*50 + "\n")
+                f.write(f"Error Type: {type(e).__name__}\n")
+                f.write(f"Error Message: {str(e)}\n")
+                f.write(f"Error Args: {e.args}\n\n")
+                f.write("Full Traceback:\n")
+                f.write("".join(traceback.format_exception(type(e), e, e.__traceback__)))
+                
+            print(f"   📝 Detalles del error guardados en: {error_log_path}")
+        except:
+            print("   ⚠️  No se pudo guardar el log de error en archivo")
+        
         sys.exit(1)
         
     except Exception as e:

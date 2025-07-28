@@ -64,17 +64,22 @@ else:
 
 print(f"[INFO] Directorio de trabajo actual → {Path.cwd()}")
 
-# ───────────── 3. Construcción y optimización del modelo ────────────────────
+# ───────── 3. Construcción y optimización del modelo ──────────
 ontology = CaptionOntology({"eyeglasses": "eyeglasses"})
-print("[INFO] Creando modelo DETIC …")
-detic_model = DETIC(ontology=ontology)                   # wrapper
+detic_model = DETIC(ontology=ontology)          # wrapper
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"[INFO] Modelo listo en {device}")
 
 if device == "cuda":
-    detic_model.detic_model.half()                       # FP16
-    detic_model.detic_model = torch.compile(detic_model.detic_model)
+    # ➊ localizamos el nn.Module real
+    core_model = detic_model.detic_model.predictor.model
+
+    # ➋ optimizaciones
+    core_model.half()                            # FP16
+    core_model = torch.compile(core_model)       # Torch 2
+    detic_model.detic_model.predictor.model = core_model
+
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
     print("[INFO] Optimizaciones CUDA + FP16 activadas")

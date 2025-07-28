@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import concurrent.futures
 import os
 import io
 import sys
@@ -117,50 +118,64 @@ def download_files_parallel(
     drive_service_func,
     max_workers: int = 4
 ) -> List[str]:
+    """
+    Downloads files from Google Drive in parallel using a modern thread pool.
+    """
     valid_ext = {'.jpg','.jpeg','.png','.bmp','.tiff','.webp'}
-    valid = [(fid,name) for fid,name in files if any(name.lower().endswith(ext) for ext in valid_ext)]
-    if not valid:
+    valid_files = [
+        (fid, name) for fid, name in files
+        if any(name.lower().endswith(ext) for ext in valid_ext)
+    ]
+    if not valid_files:
         print("[WARNING] No hay imágenes válidas")
         return []
 
-    q_in = Queue()
-    q_out = Queue()
-    for item in valid:
-        q_in.put(item)
-
-    threads = []
-    for _ in range(max_workers):
-        t = threading.Thread(
-            target=download_worker,
-            args=(q_in, q_out, drive_service_func, temp_dir),
-            daemon=True
-        )
-        t.start()
-        threads.append(t)
-
     image_paths = []
     errors = 0
-    with tqdm(total=len(valid), desc="Descargando", unit="archivo") as pbar:
-        done = 0
-        while done < len(valid):
-            try:
-                status, val = q_out.get(timeout=1)
-                if status == 'success':
-                    image_paths.append(val)
-                else:
-                    print(f"[ERROR] {val}")
-                    errors += 1
-                done += 1
-                pbar.update(1)
-                pbar.set_postfix(exitosos=len(image_paths), errores=errors)
-            except:
-                continue
 
-    # Señales de cierre
-    for _ in threads:
-        q_in.put(None)
-    for t in threads:
-        t.join()
+    # This self-contained worker function will be executed by each thread.
+    # It performs a single download task.
+    def _download_task(file_id: str, name: str):
+        # Each thread creates its own service client for thread safety.
+        drive = drive_service_func()
+        local_path = os.path.join(temp_dir, name)
+        try:
+            # Re-uses your existing optimized download logic.
+            download_file_optimized(file_id, local_path, drive)
+            return local_path
+        except Exception as e:
+            # Propagate the exception, which the main thread will catch.
+            # This is cleaner than passing error messages through a queue.
+            raise RuntimeError(f"Error al descargar '{name}': {e}") from e
+
+    # ThreadPoolExecutor manages the entire lifecycle of the threads.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all download tasks to the pool. `submit` returns a Future object.
+        future_to_name = {
+            executor.submit(_download_task, fid, name): name
+            for fid, name in valid_files
+        }
+
+        # `as_completed` yields futures as they finish, perfect for a progress bar.
+        progress_bar = tqdm(
+            concurrent.futures.as_completed(future_to_name),
+            total=len(valid_files),
+            desc="Descargando",
+            unit="archivo"
+        )
+
+        for future in progress_bar:
+            try:
+                # Get the result from the completed future.
+                # If the task raised an exception, .result() will re-raise it here.
+                path = future.result()
+                image_paths.append(path)
+            except Exception as e:
+                print(f"[ERROR] {e}")
+                errors += 1
+            
+            # Update the progress bar's postfix with live results.
+            progress_bar.set_postfix(exitosos=len(image_paths), errores=errors)
 
     print(f"[INFO] Descarga completa: {len(image_paths)} éxitos, {errors} errores")
     return image_paths

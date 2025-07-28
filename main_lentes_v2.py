@@ -1,175 +1,293 @@
 #!/usr/bin/env python3
-# Nombre del archivo: deteccion_lentes_v2.py
-
-from __future__ import annotations
-
+import concurrent.futures
 import os
+import io
 import sys
-from pathlib import Path
-from typing import Iterable, Dict, List, Union
+import tempfile
+import threading
+from queue import Queue
+from typing import List, Tuple
+from tqdm import tqdm
 
-import cv2
-import dlib
-import numpy as np
-import tqdm
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaIoBaseDownload
 
-# ─────────────────── 1. Carga de modelos y rutas ────────────────────────────
-BASE_DIR = Path(__file__).resolve().parent
-MODEL_PATH = BASE_DIR / "models" / "shape_predictor_68_face_landmarks.dat"
+from deteccion_lentes_v2 import (
+    get_glasses_probability,
+    get_glasses_probability_batch,
+    configurar_optimizaciones_gpu,
+    warm_up_modelo,
+    obtener_estadisticas_cache,
+    limpiar_cache_imagenes
+)
 
-if not MODEL_PATH.exists():
-    print(f"[ERROR] Modelo no encontrado en: {MODEL_PATH}")
-    print("[INFO] Asegúrate de descargar 'shape_predictor_68_face_landmarks.dat' y colocarlo en la carpeta 'models' junto a este script.")
-    sys.exit(1)
+from exportacion_datos_excel import (
+    format_to_hyperlinks,
+    normalize_dict_lengths,
+    dict_to_excel,
+    get_file_count,
+)
 
-print("[INFO] Cargando modelos de dlib...")
-detector = dlib.get_frontal_face_detector()
-predictor = dlib.shape_predictor(str(MODEL_PATH))
-print("[INFO] ✅ Modelos dlib listos (basados en CPU).")
+# ── Constantes Globales ───────────────────────────────────────────────────────
+# <<< NUEVA VARIABLE GLOBAL >>>
+# Umbral de probabilidad para considerar que una imagen tiene lentes.
+UMBRAL_DETECCION_LENTES = 0.4486
 
-# ───────────────────────────── 2. CACHÉS ───────────────────────────────────
-_image_cache: Dict[str, np.ndarray] = {}
-_landmarks_cache: Dict[str, Union[np.ndarray, None]] = {}
-_result_cache: Dict[str, float] = {}
-MAX_CACHE_SIZE = 200
+# ── Google Drive ──────────────────────────────────────────────────────────────
+SCOPES     = ["https://www.googleapis.com/auth/drive.readonly"]
+TOKEN_FILE = "token.json"
+CREDS_FILE = "credentials.json"
 
-# ─────────────────────── 3. utilidades internas ───────────────────────────
-def _get_image_hash(ruta_imagen: str) -> str:
-    """Genera una clave única para el caché basada en metadatos del archivo."""
-    try:
-        st = os.stat(ruta_imagen)
-        return f"{ruta_imagen}_{st.st_mtime}_{st.st_size}"
-    except FileNotFoundError:
-        return ruta_imagen
+def drive_service():
+    if os.path.exists(TOKEN_FILE):
+        creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
+    else:
+        flow  = InstalledAppFlow.from_client_secrets_file(CREDS_FILE, SCOPES)
+        creds = flow.run_local_server(port=0)
+        with open(TOKEN_FILE, "w") as f:
+            f.write(creds.to_json())
+    return build("drive", "v3", credentials=creds)
 
-def _manage_cache(cache: dict, max_size: int):
-    """Limpia una parte del caché si excede el tamaño máximo."""
-    if len(cache) > max_size:
-        keys_to_remove = list(cache.keys())[:max_size // 5]
-        for key in keys_to_remove:
-            cache.pop(key, None)
+def get_folder_id_by_path(path: str, drive):
+    segments  = [s for s in path.strip("/").split("/") if s and s != "Mi unidad"]
+    parent_id = "root"
+    for name in segments:
+        resp = drive.files().list(
+            q=(
+                f"name = '{name}' and "
+                "mimeType = 'application/vnd.google-apps.folder' and "
+                f"'{parent_id}' in parents and trashed = false"
+            ),
+            fields="files(id)",
+            pageSize=1,
+        ).execute()
+        items = resp.get("files", [])
+        if not items:
+            raise FileNotFoundError(f"Carpeta '{name}' no encontrada (parent={parent_id})")
+        parent_id = items[0]["id"]
+    return parent_id
 
-def _load_image_optimized(ruta_imagen: str) -> np.ndarray:
-    """Carga una imagen desde el caché o disco, redimensionándola si es necesario."""
-    img_hash = _get_image_hash(ruta_imagen)
-    _manage_cache(_image_cache, MAX_CACHE_SIZE)
+def list_files_recursive(folder_id: str, drive) -> List[Tuple[str, str]]:
+    results = []
+    query = f"'{folder_id}' in parents and trashed = false"
+    page_token = None
+    while True:
+        resp = drive.files().list(
+            q=query,
+            fields="nextPageToken, files(id, name, mimeType)",
+            pageToken=page_token,
+        ).execute()
+        for f in resp["files"]:
+            if f["mimeType"] == "application/vnd.google-apps.folder":
+                results.extend(list_files_recursive(f["id"], drive))
+            else:
+                results.append((f["id"], f["name"]))
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return results
 
-    if img_hash not in _image_cache:
-        if not os.path.exists(ruta_imagen):
-            raise FileNotFoundError(f"Imagen no encontrada: {ruta_imagen}")
-        
-        img = cv2.imread(ruta_imagen)
-        if img is None:
-            raise IOError(f"No se pudo cargar la imagen: {ruta_imagen}")
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+# OPTIMIZACIÓN: descarga con chunks grandes
+def download_file_optimized(file_id: str, dest_path: str, drive, chunk_size: int = 10 * 1024 * 1024):
+    request = drive.files().get_media(fileId=file_id)
+    fh = io.FileIO(dest_path, "wb")
+    downloader = MediaIoBaseDownload(fh, request, chunksize=chunk_size)
+    done = False
+    while not done:
+        _, done = downloader.next_chunk()
+    fh.close()
 
-        h, w = img.shape[:2]
-        target = 1024
-        if max(h, w) > target:
-            scale = target / max(h, w)
-            img = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR)
-        _image_cache[img_hash] = img
-        
-    return _image_cache[img_hash]
+# Worker para descarga en paralelo
+def download_worker(q_in: Queue, q_out: Queue, drive_service_func, temp_dir: str):
+    drive = drive_service_func()
+    while True:
+        item = q_in.get()
+        if item is None:
+            break
+        file_id, name = item
+        local_path = os.path.join(temp_dir, name)
+        try:
+            download_file_optimized(file_id, local_path, drive)
+            q_out.put(('success', local_path))
+        except Exception as e:
+            q_out.put(('error', f"{name}: {e}"))
+        finally:
+            q_in.task_done()
 
-# ────────────────────── 4. API Principal (Optimizada) ─────────────────────
-def get_glasses_probability(path: str, umbral_min: float = 0.0) -> Union[float, str]:
-    """Estima la probabilidad de que haya gafas en la imagen."""
-    # El parámetro 'umbral_min' se mantiene por compatibilidad, pero no se usa en la lógica de dlib.
-    try:
-        img_hash = _get_image_hash(path)
+# Función de ayuda: descargas paralelas
+def download_files_parallel(
+    files: List[Tuple[str, str]],
+    temp_dir: str,
+    drive_service_func,
+    max_workers: int = 4
+) -> List[str]:
+    """
+    Downloads files from Google Drive in parallel using a modern thread pool.
+    """
+    valid_ext = {'.jpg','.jpeg','.png','.bmp','.tiff','.webp'}
+    valid_files = [
+        (fid, name) for fid, name in files
+        if any(name.lower().endswith(ext) for ext in valid_ext)
+    ]
+    if not valid_files:
+        print("[WARNING] No hay imágenes válidas")
+        return []
 
-        if img_hash in _result_cache:
-            return _result_cache[img_hash]
-        
-        _manage_cache(_result_cache, MAX_CACHE_SIZE * 2)
+    image_paths = []
+    errors = 0
 
-        landmarks = None
-        if img_hash in _landmarks_cache:
-            landmarks = _landmarks_cache[img_hash]
-        else:
-            _manage_cache(_landmarks_cache, MAX_CACHE_SIZE)
-            img = _load_image_optimized(path)
+    # This self-contained worker function will be executed by each thread.
+    # It performs a single download task.
+    def _download_task(file_id: str, name: str):
+        # Each thread creates its own service client for thread safety.
+        drive = drive_service_func()
+        local_path = os.path.join(temp_dir, name)
+        try:
+            # Re-uses your existing optimized download logic.
+            download_file_optimized(file_id, local_path, drive)
+            return local_path
+        except Exception as e:
+            # Propagate the exception, which the main thread will catch.
+            # This is cleaner than passing error messages through a queue.
+            raise RuntimeError(f"Error al descargar '{name}': {e}") from e
+
+    # ThreadPoolExecutor manages the entire lifecycle of the threads.
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all download tasks to the pool. `submit` returns a Future object.
+        future_to_name = {
+            executor.submit(_download_task, fid, name): name
+            for fid, name in valid_files
+        }
+
+        # `as_completed` yields futures as they finish, perfect for a progress bar.
+        progress_bar = tqdm(
+            concurrent.futures.as_completed(future_to_name),
+            total=len(valid_files),
+            desc="Descargando",
+            unit="archivo"
+        )
+
+        for future in progress_bar:
+            try:
+                # Get the result from the completed future.
+                # If the task raised an exception, .result() will re-raise it here.
+                path = future.result()
+                image_paths.append(path)
+            except Exception as e:
+                print(f"[ERROR] {e}")
+                errors += 1
             
-            faces = detector(img)
-            if faces:
-                landmarks = np.array([[p.x, p.y] for p in predictor(img, faces[0]).parts()])
-            _landmarks_cache[img_hash] = landmarks
+            # Update the progress bar's postfix with live results.
+            progress_bar.set_postfix(exitosos=len(image_paths), errores=errors)
 
-        if landmarks is None:
-            _result_cache[img_hash] = 0.0
-            return 'No face detected'
+    print(f"[INFO] Descarga completa: {len(image_paths)} éxitos, {errors} errores")
+    return image_paths
 
-        nose_bridge_points = landmarks[27:31]
-        x_coords, y_coords = nose_bridge_points[:, 0], nose_bridge_points[:, 1]
-        
-        padding = 5
-        x_min, x_max = int(min(x_coords) - padding), int(max(x_coords) + padding)
-        y_min, y_max = int(landmarks[27][1] - padding), int(landmarks[30][1] + padding)
+# ── Versión optimizada con descarga paralela ─────────────────────────────────
+def process_drive_folder_optimized(
+    drive_folder_path: str,
+    usar_batch: bool = True,
+    umbral_minimo: float = 0.0,
+    max_workers: int = 4
+) -> Tuple[List[str], List[float]]:
+    print("[INFO] 🚀 Iniciando procesamiento ultra-optimizado...")
+    configurar_optimizaciones_gpu()
+    warm_up_modelo()
 
-        img_gray = cv2.cvtColor(_image_cache[img_hash], cv2.COLOR_RGB2GRAY)
-        cropped_nose_area = img_gray[y_min:y_max, x_min:x_max]
+    drive = drive_service()
+    folder_id = get_folder_id_by_path(drive_folder_path, drive)
+    files = list_files_recursive(folder_id, drive)
+    if not files:
+        print("[ERROR] No se encontraron archivos.")
+        return [], []
 
-        if cropped_nose_area.size == 0: return 0.0
+    print(f"[INFO] Encontrados {len(files)} archivos")
 
-        img_blur = cv2.GaussianBlur(cropped_nose_area, (5, 5), 0)
-        edges = cv2.Canny(image=img_blur, threshold1=50, threshold2=150)
+    temp_dir = tempfile.mkdtemp(prefix="glasses_optimized_")
+    print(f"[INFO] Directorio temporal: {temp_dir}")
 
-        center_x = edges.shape[1] // 2
-        center_cols = edges[:, max(0, center_x - 1):center_x + 1]
+    # FASE 1: Descarga paralela
+    image_paths = download_files_parallel(files, temp_dir, drive_service, max_workers)
+    if not image_paths:
+        print("[WARNING] No se descargaron imágenes válidas")
+        return [], []
 
-        glasses_prob = np.count_nonzero(center_cols) / center_cols.size if center_cols.size > 0 else 0.0
-        
-        _result_cache[img_hash] = glasses_prob
-        return glasses_prob
+    print(f"[INFO] ✅ Descargadas {len(image_paths)} imágenes")
+    print("[INFO] 🔍 Iniciando detección de lentes...")
 
-    except (FileNotFoundError, IOError) as e:
-        return str(e)
+    # FASE 2: Detección
+    if usar_batch and len(image_paths) > 1:
+        glasses_probs = get_glasses_probability_batch(image_paths, umbral_minimo)
+        # <<< MODIFICADO >>> Se usa la variable global
+        pos = sum(1 for p in glasses_probs if p >= UMBRAL_DETECCION_LENTES)
+        print(f"[INFO] ✅ Batch completado ({pos}/{len(glasses_probs)} positivos)")
+    else:
+        glasses_probs: List[float] = []
+        for path in tqdm(image_paths, desc="Detectando lentes", unit="imagen"):
+            try:
+                glasses_probs.append(get_glasses_probability(path, umbral_minimo))
+            except Exception as e:
+                print(f"[ERROR] {path}: {e}")
+                glasses_probs.append(0.0)
+
+    # FASE 3: Estadísticas finales
+    print("[INFO] 📈 Estadísticas finales:")
+    obtener_estadisticas_cache()
+    total = len(glasses_probs)
+    # <<< MODIFICADO >>> Se usa la variable global
+    con_lentes = sum(1 for p in glasses_probs if p >= UMBRAL_DETECCION_LENTES)
+    sin_lentes = total - con_lentes
+    prom = sum(glasses_probs) / total if total else 0
+    print(f"👓 Con lentes: {con_lentes} ({con_lentes/total*100:.1f}%)")
+    print(f"👁️ Sin lentes: {sin_lentes} ({sin_lentes/total*100:.1f}%)")
+    print(f"📊 Promedio: {prom:.3f}")
+
+    return image_paths, glasses_probs
+
+# ── Interfaz compatible ──────────────────────────────────────────────────────
+def process_drive_folder(drive_folder_path: str) -> Tuple[List[str], List[float]]:
+    return process_drive_folder_optimized(drive_folder_path, usar_batch=True)
+
+# ── Main ─────────────────────────────────────────────────────────────────────
+if __name__ == "__main__":
+    dataset_drive_path = (
+        "/Mi unidad/INGENIERIA_EN_SOFTWARE/6to_Semestre/"
+        "PRACTICAS/Practicas-FOTOS/Primera_Revision/"
+        "validator/results/validated_color"
+    )
+    USAR_BATCH = True
+    UMBRAL_MIN = 0.0
+    MAX_THREADS = 6
+
+    try:
+        paths, probs = process_drive_folder_optimized(
+            dataset_drive_path,
+            usar_batch=USAR_BATCH,
+            umbral_minimo=UMBRAL_MIN,
+            max_workers=MAX_THREADS
+        )
+        if not paths:
+            sys.exit(1)
+
+        info = {
+            "Rutas": format_to_hyperlinks(paths),
+            "Probabilidad": probs,
+            # <<< MODIFICADO >>> Se usa la variable global
+            "Detección": ["SÍ" if p >= UMBRAL_DETECCION_LENTES else "NO" for p in probs]
+        }
+        normalized = normalize_dict_lengths(info)
+        out = dict_to_excel(
+            normalized,
+            f"results/Reporte_{get_file_count('results')+1}.xlsx"
+        )
+        print(f"✅ Listo. Excel generado en: {out}")
+    except KeyboardInterrupt:
+        print("\n[INFO] Interrumpido por usuario")
+        limpiar_cache_imagenes()
+        sys.exit(0)
     except Exception as e:
-        print(f"[ERROR] Error inesperado procesando {path}: {e}")
-        return "Processing error"
-
-# ────────────────────── 5. utilidades de gestión ───────────────────────────
-def limpiar_cache_imagenes():
-    _image_cache.clear()
-    _landmarks_cache.clear()
-    _result_cache.clear()
-    print("[INFO] ✅ Todos los cachés (dlib) han sido limpiados.")
-
-def obtener_estadisticas_cache():
-    print("[INFO] Estadísticas de caché (dlib):")
-    print(f"  - Imágenes raw cargadas : {len(_image_cache)} / {MAX_CACHE_SIZE}")
-    print(f"  - Puntos faciales       : {len(_landmarks_cache)} / {MAX_CACHE_SIZE}")
-    print(f"  - Resultados            : {len(_result_cache)} / {MAX_CACHE_SIZE * 2}")
-
-
-# █▀▀ █▀█ █▀▄▀█ █▀▀ ▄▀█ ▀█▀ █ █▄ █ █ █▀█ █▄ █
-# █▄▄ █γκ █ ▀ █ ██▄ █▀█  █  █ █ ▀█ █ █▄█ █ ▀█
-#
-# --- FUNCIONES DE COMPATIBILIDAD ---
-# Estas funciones permiten que el script principal funcione sin cambios.
-
-def configurar_optimizaciones_gpu():
-    """Función vacía por compatibilidad. Dlib usa CPU por defecto."""
-    print("[INFO] Detector dlib (CPU) no requiere configuración de GPU.")
-    pass
-
-def warm_up_modelo():
-    """Función vacía por compatibilidad. Dlib no necesita pre-calentamiento."""
-    print("[INFO] Detector dlib (CPU) no necesita pre-calentamiento.")
-    pass
-
-def get_glasses_probability_batch(
-    rutas_imagenes: Iterable[str], umbral_min: float = 0.0
-) -> List[float]:
-    """
-    Adaptador para el procesamiento por lotes. Llama a la función principal
-    en un bucle y devuelve una lista de probabilidades, como se espera.
-    """
-    resultados = []
-    # Usa tqdm aquí para mostrar el progreso de la detección
-    for ruta in tqdm.tqdm(list(rutas_imagenes), desc="Detectando lentes (dlib)"):
-        prob = get_glasses_probability(ruta, umbral_min)
-        # Si hay un error (devuelve string), se convierte en 0.0
-        resultados.append(prob if isinstance(prob, float) else 0.0)
-    return resultados
+        print(f"\n[ERROR] {e}")
+        limpiar_cache_imagenes()
+        sys.exit(1)

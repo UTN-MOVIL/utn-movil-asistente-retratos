@@ -235,7 +235,7 @@ def get_glasses_probability_batch(
     imagenes_np = []
     rutas_a_procesar = [] # <-- Lista saneada de rutas que sí se pudieron cargar.
 
-    for ruta in tqdm(rutas_a_procesar_inicial, desc="Verificando y cargando imágenes"):
+    for ruta in tqdm.tqdm(rutas_a_procesar_inicial, desc="Verificando y cargando imágenes"):
         try:
             # Intentamos cargar cada imagen
             img = _load_image_optimized(ruta)

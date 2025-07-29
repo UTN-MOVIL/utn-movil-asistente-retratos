@@ -278,13 +278,15 @@ if __name__ == "__main__":
         if not paths:
             sys.exit(1)
 
+        ordered_probs = [probs[p] for p in paths] if isinstance(probs, dict) else probs
+
         info = {
             "Rutas": format_to_hyperlinks(paths),
-            "Probabilidad": probs, # Keep original list to see error messages in Excel
+            "Probabilidad": ordered_probs, # Now this is a list, as expected
             "Detección": [
                 "SÍ" if isinstance(p, (int, float)) and p >= UMBRAL_DETECCION_LENTES 
                 else "NO" 
-                for p in probs
+                for p in ordered_probs # Iterate over the new list
             ]
         }
         normalized = normalize_dict_lengths(info)

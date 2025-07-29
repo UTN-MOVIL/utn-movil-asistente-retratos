@@ -211,12 +211,13 @@ def get_glasses_probability_batch(
     """
     Procesa un lote de imágenes de forma optimizada.
     Si la GPU está habilitada, utiliza el procesamiento por lotes del detector CNN.
+    Esta versión es RESISTENTE a archivos de imagen corruptos.
     """
     if detector is None:
         raise RuntimeError("Los modelos no han sido cargados. Llama a 'configurar_optimizaciones_gpu' primero.")
 
     resultados: Dict[str, float] = {}
-    rutas_a_procesar = [r for r in rutas_imagenes if _get_image_hash(r) not in _result_cache]
+    rutas_a_procesar_inicial = [r for r in rutas_imagenes if _get_image_hash(r) not in _result_cache]
     
     # Cargar resultados del caché primero
     for ruta in rutas_imagenes:
@@ -224,12 +225,36 @@ def get_glasses_probability_batch(
         if img_hash in _result_cache:
             resultados[ruta] = _result_cache[img_hash]
 
-    if not rutas_a_procesar:
+    if not rutas_a_procesar_inicial:
         return resultados
 
-    print(f"[INFO] Procesando {len(rutas_a_procesar)} imágenes nuevas en lotes...")
-    imagenes_np = [_load_image_optimized(p) for p in rutas_a_procesar]
+    print(f"[INFO] Procesando {len(rutas_a_procesar_inicial)} imágenes nuevas en lotes...")
     
+    # --- INICIO DE LA CORRECCIÓN ---
+    # Reemplazamos la list comprehension por un bucle para manejar errores individuales.
+    imagenes_np = []
+    rutas_a_procesar = [] # <-- Lista saneada de rutas que sí se pudieron cargar.
+
+    for ruta in rutas_a_procesar_inicial:
+        try:
+            # Intentamos cargar cada imagen
+            img = _load_image_optimized(ruta)
+            imagenes_np.append(img)
+            rutas_a_procesar.append(ruta)
+        except IOError as e:
+            # Si la imagen está corrupta, _load_image_optimized lanzará IOError
+            print(f"⚠️ [ADVERTENCIA] Se omitirá el archivo corrupto o ilegible: {ruta}")
+            # Asignamos un código de error específico para "archivo corrupto"
+            error_code = -2.0 
+            resultados[ruta] = error_code
+            _result_cache[_get_image_hash(ruta)] = error_code
+
+    # Si después de filtrar no quedan imágenes válidas, terminamos.
+    if not rutas_a_procesar:
+        print("[INFO] No quedaron imágenes válidas para procesar después del filtrado.")
+        return resultados
+    # --- FIN DE LA CORRECCIÓN ---
+
     if GPU_ENABLED:
         # Detección por lotes real (mucho más rápido en GPU)
         all_faces = detector(imagenes_np, 1, batch_size=batch_size)
@@ -248,16 +273,19 @@ def get_glasses_probability_batch(
             landmarks = _get_landmarks_for_image(img_rgb)
             _landmarks_cache[_get_image_hash(ruta)] = landmarks
 
-    # Calcular probabilidades para todas las imágenes procesadas (nuevas y cacheadas)
+    # Calcular probabilidades solo para las imágenes que se procesaron
     for ruta in rutas_a_procesar:
-        landmarks = _landmarks_cache[_get_image_hash(ruta)]
+        landmarks = _landmarks_cache.get(_get_image_hash(ruta))
         if landmarks is not None:
-            img_rgb = _load_image_optimized(ruta) # Recargar por si fue purgado del caché
+            # Recargamos la imagen por si el caché la eliminó
+            img_rgb = _load_image_optimized(ruta) 
             prob = _calculate_prob_from_landmarks(img_rgb, landmarks)
             resultados[ruta] = prob
             _result_cache[_get_image_hash(ruta)] = prob
         else:
-            resultados[ruta] = -1.0 # Usar -1.0 para 'No face detected' en lotes
+            # Usar -1.0 para 'No face detected' en lotes
+            resultados[ruta] = -1.0 
+            _result_cache[_get_image_hash(ruta)] = -1.0
 
     return resultados
 

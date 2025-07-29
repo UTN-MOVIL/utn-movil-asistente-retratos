@@ -18,8 +18,7 @@ from deteccion_lentes_v2 import (
     get_glasses_probability_batch,
     configurar_optimizaciones_gpu,
     warm_up_modelo,
-    obtener_estadisticas_cache,
-    limpiar_cache_imagenes
+    obtener_estadisticas_cache
 )
 
 from exportacion_datos_excel import (
@@ -317,7 +316,6 @@ if __name__ == "__main__":
         print(f"✅ Listo. Excel generado en: {out}")
     except KeyboardInterrupt:
         print("\n[INFO] Interrumpido por usuario")
-        limpiar_cache_imagenes()
         sys.exit(0)
     except FileNotFoundError as e:
         print(f"\n[ERROR DE RUTA] No se pudo encontrar una carpeta en Google Drive: {e}")
@@ -326,6 +324,4 @@ if __name__ == "__main__":
         print(f"\n[ERROR INESPERADO] Se ha producido un error. Detalles:")
         # 2. Imprimir la traza completa del error
         traceback.print_exc()
-        
-        limpiar_cache_imagenes()
         sys.exit(1)

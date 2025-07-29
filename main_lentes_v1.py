@@ -19,8 +19,7 @@ from deteccion_lentes_v1 import (
     get_glasses_probability_batch,
     configurar_optimizaciones_gpu,
     warm_up_modelo,
-    obtener_estadisticas_cache,
-    limpiar_cache_imagenes
+    obtener_estadisticas_cache
 )
 
 from exportacion_datos_excel import (
@@ -346,9 +345,7 @@ if __name__ == "__main__":
         
     except KeyboardInterrupt:
         print("\n[INFO] Interrumpido por usuario")
-        limpiar_cache_imagenes()
         sys.exit(0)
     except Exception as e:
         print(f"\n[ERROR] {e}")
-        limpiar_cache_imagenes()
         sys.exit(1)

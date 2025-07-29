@@ -246,8 +246,8 @@ def process_drive_folder(drive_folder_path: str) -> Tuple[List[str], List[float]
 # ── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     dataset_drive_path = (
-        "/Mi unidad/INGENIERIA_EN_SOFTWARE/6to_Semestre/"
-        "PRACTICAS/Practicas-FOTOS/Primera_Revision/"
+        "/Mi unidad/INGENIERIA_EN_SOFTWARE/5to_Semestre/"
+        "PRACTICAS/Primera_Revision/"
         "validator/results/sin_procesar"
     )
     USAR_BATCH = True

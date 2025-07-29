@@ -3,8 +3,7 @@ import concurrent.futures
 import os
 import io
 import sys
-import tempfile
-import threading
+import traceback
 from queue import Queue
 from typing import List, Tuple
 from tqdm import tqdm
@@ -287,6 +286,9 @@ if __name__ == "__main__":
         print(f"\n[ERROR DE RUTA] No se pudo encontrar una carpeta en Google Drive: {e}")
         sys.exit(1)
     except Exception as e:
-        print(f"\n[ERROR INESPERADO] {e}")
-        limpiar_cache_imagenes()
-        sys.exit(1)
+    print(f"\n[ERROR INESPERADO] Se ha producido un error. Detalles:")
+    # 2. Imprimir la traza completa del error
+    traceback.print_exc()
+    
+    limpiar_cache_imagenes()
+    sys.exit(1)

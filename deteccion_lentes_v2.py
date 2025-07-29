@@ -234,7 +234,8 @@ def get_glasses_probability_batch(
         # Detección por lotes real (mucho más rápido en GPU)
         all_faces = detector(imagenes_np, 1, batch_size=batch_size)
         
-        for i, (ruta, img_rgb, faces) in enumerate(zip(rutas_a_procesar, imagenes_np, all_faces)):
+        iterable = enumerate(zip(rutas_a_procesar, imagenes_np, all_faces))
+        for i, (ruta, img_rgb, faces) in tqdm.tqdm(iterable, desc="Extrayendo Landmarks (GPU)"):
             landmarks = None
             if faces:
                 shape = predictor(img_rgb, faces[0].rect)

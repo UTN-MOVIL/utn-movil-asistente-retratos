@@ -235,15 +235,17 @@ def get_glasses_probability_batch(
     imagenes_np = []
     rutas_a_procesar = [] # <-- Lista saneada de rutas que sí se pudieron cargar.
 
-    for ruta in rutas_a_procesar_inicial:
+    for ruta in tqdm(rutas_a_procesar_inicial, desc="Verificando y cargando imágenes"):
         try:
             # Intentamos cargar cada imagen
             img = _load_image_optimized(ruta)
             imagenes_np.append(img)
             rutas_a_procesar.append(ruta)
         except IOError as e:
-            # Si la imagen está corrupta, _load_image_optimized lanzará IOError
-            print(f"⚠️ [ADVERTENCIA] Se omitirá el archivo corrupto o ilegible: {ruta}")
+            # Si la imagen está corrupta, _load_image_optimized lanzará IOError.
+            # El \n al inicio del print evita que se rompa la barra de progreso.
+            tqdm.write(f"\n⚠️ [ADVERTENCIA] Se omitirá el archivo corrupto o ilegible: {ruta}")
+            
             # Asignamos un código de error específico para "archivo corrupto"
             error_code = -2.0 
             resultados[ruta] = error_code

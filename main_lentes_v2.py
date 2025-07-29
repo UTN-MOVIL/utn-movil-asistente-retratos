@@ -280,8 +280,12 @@ if __name__ == "__main__":
 
         info = {
             "Rutas": format_to_hyperlinks(paths),
-            "Probabilidad": probs,
-            "Detección": ["SÍ" if p >= UMBRAL_DETECCION_LENTES else "NO" for p in probs]
+            "Probabilidad": probs, # Keep original list to see error messages in Excel
+            "Detección": [
+                "SÍ" if isinstance(p, (int, float)) and p >= UMBRAL_DETECCION_LENTES 
+                else "NO" 
+                for p in probs
+            ]
         }
         normalized = normalize_dict_lengths(info)
         out = dict_to_excel(

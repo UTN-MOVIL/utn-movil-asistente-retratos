@@ -206,89 +206,83 @@ def get_glasses_probability(path: str) -> float: # <--- Change type hint to floa
 
 def get_glasses_probability_batch(
     rutas_imagenes: List[str],
-    batch_size: int = 32,
+    batch_size: int = 32, # Un batch_size de 16, 32 o 64 es un buen punto de partida
 ) -> Dict[str, float]:
     """
-    Procesa un lote de imágenes de forma optimizada.
-    Si la GPU está habilitada, utiliza el procesamiento por lotes del detector CNN.
-    Esta versión es RESISTENTE a archivos de imagen corruptos.
+    Procesa un lote de imágenes de forma optimizada y con uso eficiente de memoria,
+    cargando y procesando las imágenes en lotes pequeños.
     """
     if detector is None:
         raise RuntimeError("Los modelos no han sido cargados. Llama a 'configurar_optimizaciones_gpu' primero.")
 
     resultados: Dict[str, float] = {}
-    rutas_a_procesar_inicial = [r for r in rutas_imagenes if _get_image_hash(r) not in _result_cache]
     
-    # Cargar resultados del caché primero
+    # 1. Cargar resultados del caché primero (sin cambios)
+    rutas_a_procesar_inicial = []
     for ruta in rutas_imagenes:
         img_hash = _get_image_hash(ruta)
         if img_hash in _result_cache:
             resultados[ruta] = _result_cache[img_hash]
+        else:
+            rutas_a_procesar_inicial.append(ruta)
 
     if not rutas_a_procesar_inicial:
         return resultados
 
-    print(f"[INFO] Procesando {len(rutas_a_procesar_inicial)} imágenes nuevas en lotes...")
-    
-    # --- INICIO DE LA CORRECCIÓN ---
-    # Reemplazamos la list comprehension por un bucle para manejar errores individuales.
-    imagenes_np = []
-    rutas_a_procesar = [] # <-- Lista saneada de rutas que sí se pudieron cargar.
+    print(f"[INFO] Procesando {len(rutas_a_procesar_inicial)} imágenes nuevas en {len(rutas_a_procesar_inicial) // batch_size + 1} lotes...")
 
-    for ruta in tqdm.tqdm(rutas_a_procesar_inicial, desc="Verificando y cargando imágenes"):
-        try:
-            # Intentamos cargar cada imagen
-            img = _load_image_optimized(ruta)
-            imagenes_np.append(img)
-            rutas_a_procesar.append(ruta)
-        except IOError as e:
-            # Si la imagen está corrupta, _load_image_optimized lanzará IOError.
-            # El \n al inicio del print evita que se rompa la barra de progreso.
-            tqdm.tqdm.write(f"\n⚠️ [ADVERTENCIA] Se omitirá el archivo corrupto o ilegible: {ruta}")
-            
-            # Asignamos un código de error específico para "archivo corrupto"
-            error_code = -2.0 
-            resultados[ruta] = error_code
-            _result_cache[_get_image_hash(ruta)] = error_code
-
-    # Si después de filtrar no quedan imágenes válidas, terminamos.
-    if not rutas_a_procesar:
-        print("[INFO] No quedaron imágenes válidas para procesar después del filtrado.")
-        return resultados
-    # --- FIN DE LA CORRECCIÓN ---
-
-    if GPU_ENABLED:
-        # Detección por lotes real (mucho más rápido en GPU)
-        all_faces = detector(imagenes_np, 1, batch_size=batch_size)
+    # 2. Iterar sobre las rutas en lotes pequeños
+    for i in tqdm.tqdm(range(0, len(rutas_a_procesar_inicial), batch_size), desc="Procesando Lotes"):
+        # Obtiene las rutas para el lote actual
+        batch_paths = rutas_a_procesar_inicial[i : i + batch_size]
         
-        iterable = enumerate(zip(rutas_a_procesar, imagenes_np, all_faces))
-        for i, (ruta, img_rgb, faces) in tqdm.tqdm(iterable, desc="Extrayendo Landmarks (GPU)"):
-            landmarks = None
-            if faces:
-                shape = predictor(img_rgb, faces[0].rect)
-                landmarks = np.array([[p.x, p.y] for p in shape.parts()])
-            
-            _landmarks_cache[_get_image_hash(ruta)] = landmarks
-    else:
-        # Fallback a procesamiento en bucle para CPU
-        for ruta, img_rgb in zip(rutas_a_procesar, imagenes_np):
-            landmarks = _get_landmarks_for_image(img_rgb)
-            _landmarks_cache[_get_image_hash(ruta)] = landmarks
+        # Carga solo las imágenes de ESTE lote
+        batch_images = []
+        valid_batch_paths = []
+        for ruta in batch_paths:
+            try:
+                img = _load_image_optimized(ruta)
+                batch_images.append(img)
+                valid_batch_paths.append(ruta)
+            except IOError:
+                tqdm.tqdm.write(f"\n⚠️ [ADVERTENCIA] Se omitirá el archivo corrupto: {ruta}")
+                resultados[ruta] = -2.0
+                _result_cache[_get_image_hash(ruta)] = -2.0
+        
+        if not valid_batch_paths:
+            continue # Si todas las imágenes del lote estaban corruptas, pasar al siguiente
 
-    # Calcular probabilidades solo para las imágenes que se procesaron
-    for ruta in rutas_a_procesar:
+        # 3. Procesa el lote actual (con la memoria ya controlada)
+        if GPU_ENABLED:
+            # Detección por lotes en la GPU
+            all_faces = detector(batch_images, 1, batch_size=len(batch_images)) # El batch_size aquí es el del lote actual
+            
+            # Extraer landmarks para el lote actual
+            for ruta, img_rgb, faces in zip(valid_batch_paths, batch_images, all_faces):
+                landmarks = None
+                if faces:
+                    shape = predictor(img_rgb, faces[0].rect)
+                    landmarks = np.array([[p.x, p.y] for p in shape.parts()])
+                _landmarks_cache[_get_image_hash(ruta)] = landmarks
+        else:
+            # Procesamiento en CPU (uno por uno)
+            for ruta, img_rgb in zip(valid_batch_paths, batch_images):
+                landmarks = _get_landmarks_for_image(img_rgb)
+                _landmarks_cache[_get_image_hash(ruta)] = landmarks
+
+    # 4. Calcular probabilidades para todas las imágenes procesadas (sin cambios)
+    rutas_finales = [r for r in rutas_a_procesar_inicial if r not in resultados] # Rutas que no fallaron al cargar
+    for ruta in rutas_finales:
         landmarks = _landmarks_cache.get(_get_image_hash(ruta))
         if landmarks is not None:
-            # Recargamos la imagen por si el caché la eliminó
-            img_rgb = _load_image_optimized(ruta) 
+            img_rgb = _load_image_optimized(ruta)
             prob = _calculate_prob_from_landmarks(img_rgb, landmarks)
             resultados[ruta] = prob
             _result_cache[_get_image_hash(ruta)] = prob
         else:
-            # Usar -1.0 para 'No face detected' en lotes
-            resultados[ruta] = -1.0 
+            resultados[ruta] = -1.0 # No face detected
             _result_cache[_get_image_hash(ruta)] = -1.0
-
+            
     return resultados
 
 def obtener_estadisticas_cache():

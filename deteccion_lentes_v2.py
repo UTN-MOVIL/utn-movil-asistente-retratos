@@ -244,7 +244,7 @@ def get_glasses_probability_batch(
         except IOError as e:
             # Si la imagen está corrupta, _load_image_optimized lanzará IOError.
             # El \n al inicio del print evita que se rompa la barra de progreso.
-            tqdm.write(f"\n⚠️ [ADVERTENCIA] Se omitirá el archivo corrupto o ilegible: {ruta}")
+            tqdm.tqdm.write(f"\n⚠️ [ADVERTENCIA] Se omitirá el archivo corrupto o ilegible: {ruta}")
             
             # Asignamos un código de error específico para "archivo corrupto"
             error_code = -2.0 

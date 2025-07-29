@@ -23,8 +23,8 @@ CNN_FACE_DETECTOR_PATH = MODELS_DIR / "mmod_human_face_detector.dat"
 detector: Optional[callable] = None
 predictor: Optional[dlib.shape_predictor] = None
 GPU_ENABLED = False
-TARGET_WIDTH = 640
-TARGET_HEIGHT = 480
+TARGET_WIDTH = 375
+TARGET_HEIGHT = 425
 
 # ───────────────────────────── 2. CACHÉS ───────────────────────────────────
 _image_cache: Dict[str, np.ndarray] = {}

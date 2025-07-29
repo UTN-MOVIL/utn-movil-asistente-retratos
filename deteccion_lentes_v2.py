@@ -23,6 +23,8 @@ CNN_FACE_DETECTOR_PATH = MODELS_DIR / "mmod_human_face_detector.dat"
 detector: Optional[callable] = None
 predictor: Optional[dlib.shape_predictor] = None
 GPU_ENABLED = False
+TARGET_WIDTH = 640
+TARGET_HEIGHT = 480
 
 # ───────────────────────────── 2. CACHÉS ───────────────────────────────────
 _image_cache: Dict[str, np.ndarray] = {}
@@ -58,8 +60,13 @@ def _load_image_optimized(ruta_imagen: str) -> np.ndarray:
         img = cv2.imread(ruta_imagen)
         if img is None:
             raise IOError(f"No se pudo cargar la imagen: {ruta_imagen}")
+
+        # --- FIX: Resize the image to a consistent size ---
+        img_resized = cv2.resize(img, (TARGET_WIDTH, TARGET_HEIGHT))
         
-        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        # Convert the RESIZED image to RGB
+        img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+        
         _image_cache[img_hash] = img_rgb
     
     return _image_cache[img_hash]

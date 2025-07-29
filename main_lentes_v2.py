@@ -285,6 +285,8 @@ if __name__ == "__main__":
     # <--- NUEVO: Parámetro para forzar la descarga
     FORZAR_NUEVA_DESCARGA = False
 
+    os.makedirs("results", exist_ok=True)
+
     try:
         paths, probs = process_drive_folder_optimized(
             dataset_drive_path,

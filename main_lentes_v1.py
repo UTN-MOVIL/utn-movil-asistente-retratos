@@ -308,6 +308,7 @@ def process_drive_folder(drive_folder_path: str) -> Tuple[List[str], List[float]
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # --- CONFIGURACIÓN ---
     dataset_drive_path = (
         "/Mi unidad/INGENIERIA_EN_SOFTWARE/5to_Semestre/"
         "PRACTICAS/Primera_Revision/"
@@ -316,6 +317,9 @@ if __name__ == "__main__":
     USAR_BATCH = True
     UMBRAL_MIN = 0.0
     MAX_THREADS = 6
+    
+    # --- MODIFICACIÓN: Asegurar que el directorio de resultados exista ---
+    os.makedirs("results", exist_ok=True)
 
     try:
         paths, probs = process_drive_folder_optimized(
@@ -333,11 +337,13 @@ if __name__ == "__main__":
             "Detección": ["SÍ" if p>=0.4486 else "NO" for p in probs]
         }
         normalized = normalize_dict_lengths(info)
-        out = dict_to_excel(
-            normalized,
-            f"results/Reporte_{get_file_count('results')+1}.xlsx"
-        )
+        
+        # Se guarda el archivo en la carpeta "results" que ahora sabemos que existe
+        output_path = f"results/Reporte_{get_file_count('results')+1}.xlsx"
+        out = dict_to_excel(normalized, output_path)
+        
         print(f"✅ Listo. Excel generado en: {out}")
+        
     except KeyboardInterrupt:
         print("\n[INFO] Interrumpido por usuario")
         limpiar_cache_imagenes()

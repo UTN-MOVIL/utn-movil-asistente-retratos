@@ -229,15 +229,24 @@ def process_drive_folder_optimized(
     # --- FASE 3: Estadísticas finales ---
     print("\n[INFO] 📈 Estadísticas finales:")
     obtener_estadisticas_cache()
-    numeric_probs = [p for p in glasses_probs if isinstance(p, (int, float))]
 
+    numeric_probs = [p for p in glasses_probs if isinstance(p, (int, float))]
     total = len(numeric_probs)
-    con_lentes = sum(1 for p in numeric_probs if p >= UMBRAL_DETECCION_LENTES)
-    sin_lentes = total - con_lentes
-    prom = sum(numeric_probs) / total if total else 0
-    print(f"👓 Con lentes: {con_lentes} ({con_lentes/total*100:.1f}%)")
-    print(f"👁️ Sin lentes: {sin_lentes} ({sin_lentes/total*100:.1f}%)")
-    print(f"📊 Promedio: {prom:.3f}")
+
+    if total > 0:
+        con_lentes = sum(1 for p in numeric_probs if p >= UMBRAL_DETECCION_LENTES)
+        sin_lentes = total - con_lentes
+        prom = sum(numeric_probs) / total
+        
+        porc_con_lentes = (con_lentes / total) * 100
+        porc_sin_lentes = (sin_lentes / total) * 100
+
+        print(f"👓 Con lentes: {con_lentes} ({porc_con_lentes:.1f}%)")
+        print(f"👁️ Sin lentes: {sin_lentes} ({porc_sin_lentes:.1f}%)")
+        print(f"📊 Promedio: {prom:.3f}")
+    else:
+        # This message will now appear instead of a crash
+        print("⚠️ No se procesaron imágenes de forma exitosa. No se pueden calcular estadísticas.")
 
     return image_paths, glasses_probs
 

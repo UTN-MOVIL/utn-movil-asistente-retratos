@@ -149,8 +149,7 @@ def download_files_parallel(
     print(f"[INFO] Descarga completa: {len(image_paths)} éxitos, {errors} errores")
     return image_paths
 
-# ── Versión optimizada con descarga paralela Y CACHÉ ──────────────────────────
-# <--- FUNCIÓN COMPLETAMENTE ACTUALIZADA
+# ── Versión optimizada con descarga paralela Y CACHÉ MEJORADO ──────────────────
 def process_drive_folder_optimized(
     drive_folder_path: str,
     usar_batch: bool = True,
@@ -160,7 +159,7 @@ def process_drive_folder_optimized(
 ) -> Tuple[List[str], List[float]]:
     """
     Procesa imágenes de una carpeta de Drive, usando un caché local para
-    evitar descargas repetidas.
+    evitar descargas repetidas de archivos ya existentes.
     """
     print("[INFO] 🚀 Iniciando procesamiento ultra-optimizado...")
     configurar_optimizaciones_gpu()
@@ -177,8 +176,7 @@ def process_drive_folder_optimized(
 
     print(f"[INFO] Encontrados {len(remote_files)} archivos en Drive.")
     
-    # --- LÓGICA DE CACHÉ ---
-    image_paths = []
+    # --- LÓGICA DE CACHÉ MEJORADA ---
     os.makedirs(CACHE_DIR, exist_ok=True) 
 
     valid_ext = {'.jpg','.jpeg','.png','.bmp','.tiff','.webp'}
@@ -186,24 +184,45 @@ def process_drive_folder_optimized(
         (fid, name) for fid, name in remote_files 
         if any(name.lower().endswith(ext) for ext in valid_ext)
     ]
-    remote_filenames_set = {name for _, name in remote_image_files}
-    local_filenames_set = set(os.listdir(CACHE_DIR))
 
-    if not forzar_descarga and remote_filenames_set == local_filenames_set:
-        print(f"[INFO] ✅ Caché local válido encontrado. Saltando descarga.")
-        image_paths = [os.path.join(CACHE_DIR, name) for name in sorted(list(remote_filenames_set))]
-    
-    else:
-        if forzar_descarga:
-            print("[INFO] ⚠️ Se forzó la descarga. Limpiando caché anterior si es necesario.")
-            for f in os.listdir(CACHE_DIR):
+    # Si se fuerza la descarga, vaciamos la carpeta de caché primero
+    if forzar_descarga:
+        print("[INFO] ⚠️ Forzando nueva descarga. Limpiando caché local...")
+        for f in os.listdir(CACHE_DIR):
+            try:
                 os.remove(os.path.join(CACHE_DIR, f))
+            except OSError as e:
+                print(f"[WARNING] No se pudo eliminar {f} del caché: {e}")
+
+    # Creamos dos listas: una para los archivos que ya tenemos y otra para los que faltan
+    files_to_download = []
+    cached_image_paths = []
+
+    print("[INFO] 🔎 Verificando caché local...")
+    for file_id, file_name in remote_image_files:
+        local_path = os.path.join(CACHE_DIR, file_name)
+        if os.path.exists(local_path) and not forzar_descarga:
+            cached_image_paths.append(local_path)
         else:
-             print("[INFO] 🔎 Caché local desactualizado o incompleto. Iniciando descarga.")
-        
-        image_paths = download_files_parallel(
-            remote_image_files, CACHE_DIR, drive_service, max_workers
+            # Si no existe localmente o se fuerza la descarga, lo añadimos a la cola
+            files_to_download.append((file_id, file_name))
+
+    if cached_image_paths:
+        print(f"[INFO] ✅ {len(cached_image_paths)} archivos encontrados en el caché.")
+
+    # Descargamos solo los archivos que no están en el caché
+    if files_to_download:
+        print(f"[INFO] 📥 Se descargarán {len(files_to_download)} archivos nuevos o faltantes.")
+        downloaded_paths = download_files_parallel(
+            files_to_download, CACHE_DIR, drive_service, max_workers
         )
+        image_paths = cached_image_paths + downloaded_paths
+    else:
+        print("[INFO] ✅ El caché local ya está completo. No se necesitan descargas.")
+        image_paths = cached_image_paths
+
+    # Ordenamos la lista final para mantener consistencia
+    image_paths.sort()
 
     if not image_paths:
         print("[WARNING] No hay imágenes válidas para procesar.")
@@ -221,7 +240,7 @@ def process_drive_folder_optimized(
         glasses_probs: List[float] = []
         for path in tqdm(image_paths, desc="Detectando lentes", unit="imagen"):
             try:
-                glasses_probs.append(get_glasses_probability(path, umbral_minimo))
+                glasses_probs.append(get_glasses_probability(path))
             except Exception as e:
                 print(f"[ERROR] {path}: {e}")
                 glasses_probs.append(0.0)
@@ -245,7 +264,6 @@ def process_drive_folder_optimized(
         print(f"👁️ Sin lentes: {sin_lentes} ({porc_sin_lentes:.1f}%)")
         print(f"📊 Promedio: {prom:.3f}")
     else:
-        # This message will now appear instead of a crash
         print("⚠️ No se procesaron imágenes de forma exitosa. No se pueden calcular estadísticas.")
 
     return image_paths, glasses_probs
@@ -257,9 +275,9 @@ def process_drive_folder(drive_folder_path: str) -> Tuple[List[str], List[float]
 # ── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     dataset_drive_path = (
-        "/Mi unidad/INGENIERIA_EN_SOFTWARE/6to_Semestre/"
-        "PRACTICAS/Practicas-FOTOS/Primera_Revision/"
-        "validator/results/validated_color"
+        "/Mi unidad/INGENIERIA_EN_SOFTWARE/5to_Semestre/"
+        "PRACTICAS/Primera_Revision/"
+        "validator/results/sin_procesar"
     )
     USAR_BATCH = True
     UMBRAL_MIN = 0.0

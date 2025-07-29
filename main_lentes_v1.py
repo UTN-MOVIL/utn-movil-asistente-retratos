@@ -34,6 +34,8 @@ from exportacion_datos_excel import (
 SCOPES     = ["https://www.googleapis.com/auth/drive.readonly"]
 TOKEN_FILE = "token.json"
 CREDS_FILE = "credentials.json"
+CACHE_DIR = "image_cache"
+UMBRAL_DETECCION_LENTES = 0.4486
 
 def drive_service():
     if os.path.exists(TOKEN_FILE):
@@ -181,61 +183,122 @@ def download_files_parallel(
     return image_paths
 
 # ── Versión optimizada con descarga paralela ─────────────────────────────────
+# ── Versión optimizada con descarga paralela Y CACHÉ MEJORADO ──────────────────
 def process_drive_folder_optimized(
     drive_folder_path: str,
     usar_batch: bool = True,
     umbral_minimo: float = 0.0,
-    max_workers: int = 4
+    max_workers: int = 4,
+    forzar_descarga: bool = False
 ) -> Tuple[List[str], List[float]]:
+    """
+    Procesa imágenes de una carpeta de Drive, usando un caché local para
+    evitar descargas repetidas de archivos ya existentes.
+    """
     print("[INFO] 🚀 Iniciando procesamiento ultra-optimizado...")
     configurar_optimizaciones_gpu()
     warm_up_modelo()
 
     drive = drive_service()
     folder_id = get_folder_id_by_path(drive_folder_path, drive)
-    files = list_files_recursive(folder_id, drive)
-    if not files:
-        print("[ERROR] No se encontraron archivos.")
+    
+    print("[INFO] Obteniendo lista de archivos remotos de Google Drive...")
+    remote_files = list_files_recursive(folder_id, drive)
+    if not remote_files:
+        print("[ERROR] No se encontraron archivos en la carpeta de Drive.")
         return [], []
 
-    print(f"[INFO] Encontrados {len(files)} archivos")
+    print(f"[INFO] Encontrados {len(remote_files)} archivos en Drive.")
+    
+    # --- LÓGICA DE CACHÉ MEJORADA ---
+    os.makedirs(CACHE_DIR, exist_ok=True) 
 
-    temp_dir = tempfile.mkdtemp(prefix="glasses_optimized_")
-    print(f"[INFO] Directorio temporal: {temp_dir}")
+    valid_ext = {'.jpg','.jpeg','.png','.bmp','.tiff','.webp'}
+    remote_image_files = [
+        (fid, name) for fid, name in remote_files 
+        if any(name.lower().endswith(ext) for ext in valid_ext)
+    ]
 
-    # FASE 1: Descarga paralela
-    image_paths = download_files_parallel(files, temp_dir, drive_service, max_workers)
+    # Si se fuerza la descarga, vaciamos la carpeta de caché primero
+    if forzar_descarga:
+        print("[INFO] ⚠️ Forzando nueva descarga. Limpiando caché local...")
+        for f in os.listdir(CACHE_DIR):
+            try:
+                os.remove(os.path.join(CACHE_DIR, f))
+            except OSError as e:
+                print(f"[WARNING] No se pudo eliminar {f} del caché: {e}")
+
+    # Creamos dos listas: una para los archivos que ya tenemos y otra para los que faltan
+    files_to_download = []
+    cached_image_paths = []
+
+    print("[INFO] 🔎 Verificando caché local...")
+    for file_id, file_name in remote_image_files:
+        local_path = os.path.join(CACHE_DIR, file_name)
+        if os.path.exists(local_path) and not forzar_descarga:
+            cached_image_paths.append(local_path)
+        else:
+            # Si no existe localmente o se fuerza la descarga, lo añadimos a la cola
+            files_to_download.append((file_id, file_name))
+
+    if cached_image_paths:
+        print(f"[INFO] ✅ {len(cached_image_paths)} archivos encontrados en el caché.")
+
+    # Descargamos solo los archivos que no están en el caché
+    if files_to_download:
+        print(f"[INFO] 📥 Se descargarán {len(files_to_download)} archivos nuevos o faltantes.")
+        downloaded_paths = download_files_parallel(
+            files_to_download, CACHE_DIR, drive_service, max_workers
+        )
+        image_paths = cached_image_paths + downloaded_paths
+    else:
+        print("[INFO] ✅ El caché local ya está completo. No se necesitan descargas.")
+        image_paths = cached_image_paths
+
+    # Ordenamos la lista final para mantener consistencia
+    image_paths.sort()
+
     if not image_paths:
-        print("[WARNING] No se descargaron imágenes válidas")
+        print("[WARNING] No hay imágenes válidas para procesar.")
         return [], []
 
-    print(f"[INFO] ✅ Descargadas {len(image_paths)} imágenes")
+    print(f"[INFO] ✅ Listas {len(image_paths)} imágenes para procesar.")
     print("[INFO] 🔍 Iniciando detección de lentes...")
 
-    # FASE 2: Detección
+    # --- FASE 2: Detección ---
     if usar_batch and len(image_paths) > 1:
-        glasses_probs = get_glasses_probability_batch(image_paths, umbral_minimo)
-        pos = sum(1 for p in glasses_probs if p > 0.5)
+        glasses_probs = get_glasses_probability_batch(image_paths)
+        pos = sum(1 for p in glasses_probs if isinstance(p, (int, float)) and p >= UMBRAL_DETECCION_LENTES)
         print(f"[INFO] ✅ Batch completado ({pos}/{len(glasses_probs)} positivos)")
     else:
         glasses_probs: List[float] = []
         for path in tqdm(image_paths, desc="Detectando lentes", unit="imagen"):
             try:
-                glasses_probs.append(get_glasses_probability(path, umbral_minimo))
+                glasses_probs.append(get_glasses_probability(path))
             except Exception as e:
                 print(f"[ERROR] {path}: {e}")
                 glasses_probs.append(0.0)
 
-    # FASE 3: Estadísticas finales
-    print("[INFO] 📈 Estadísticas finales:")
+    # --- FASE 3: Estadísticas finales ---
+    print("\n[INFO] 📈 Estadísticas finales:")
     obtener_estadisticas_cache()
-    total = len(glasses_probs)
-    con_lentes = sum(1 for p in glasses_probs if p >= 0.5)
-    sin_lentes = total - con_lentes
-    prom = sum(glasses_probs) / total if total else 0
-    print(f"👓 Con lentes: {con_lentes} ({con_lentes/total*100:.1f}%)")
-    print(f"👁️ Sin lentes: {sin_lentes} ({sin_lentes/total*100:.1f}%)")
-    print(f"📊 Promedio: {prom:.3f}")
+
+    numeric_probs = [p for p in glasses_probs if isinstance(p, (int, float))]
+    total = len(numeric_probs)
+
+    if total > 0:
+        con_lentes = sum(1 for p in numeric_probs if p >= UMBRAL_DETECCION_LENTES)
+        sin_lentes = total - con_lentes
+        prom = sum(numeric_probs) / total
+        
+        porc_con_lentes = (con_lentes / total) * 100
+        porc_sin_lentes = (sin_lentes / total) * 100
+
+        print(f"👓 Con lentes: {con_lentes} ({porc_con_lentes:.1f}%)")
+        print(f"👁️ Sin lentes: {sin_lentes} ({porc_sin_lentes:.1f}%)")
+        print(f"📊 Promedio: {prom:.3f}")
+    else:
+        print("⚠️ No se procesaron imágenes de forma exitosa. No se pueden calcular estadísticas.")
 
     return image_paths, glasses_probs
 

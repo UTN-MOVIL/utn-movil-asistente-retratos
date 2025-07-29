@@ -229,10 +229,12 @@ def process_drive_folder_optimized(
     # --- FASE 3: Estadísticas finales ---
     print("\n[INFO] 📈 Estadísticas finales:")
     obtener_estadisticas_cache()
-    total = len(glasses_probs)
-    con_lentes = sum(1 for p in glasses_probs if p >= UMBRAL_DETECCION_LENTES)
+    numeric_probs = [p for p in glasses_probs if isinstance(p, (int, float))]
+
+    total = len(numeric_probs)
+    con_lentes = sum(1 for p in numeric_probs if p >= UMBRAL_DETECCION_LENTES)
     sin_lentes = total - con_lentes
-    prom = sum(glasses_probs) / total if total else 0
+    prom = sum(numeric_probs) / total if total else 0
     print(f"👓 Con lentes: {con_lentes} ({con_lentes/total*100:.1f}%)")
     print(f"👁️ Sin lentes: {sin_lentes} ({sin_lentes/total*100:.1f}%)")
     print(f"📊 Promedio: {prom:.3f}")

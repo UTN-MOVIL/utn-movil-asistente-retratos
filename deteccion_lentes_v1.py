@@ -166,6 +166,8 @@ def get_glasses_probability_batch(
     resultados: List[float] = [0.0] * len(rutas)
 
     batch_imgs, idxs = [], []
+    # Opcional: también puedes monitorear la carga de imágenes
+    # for i, ruta in enumerate(tqdm(rutas, desc="Cargando imágenes")):
     for i, ruta in enumerate(rutas):
         try:
             img = _load_image_optimized(ruta)
@@ -181,7 +183,9 @@ def get_glasses_probability_batch(
     with torch.inference_mode(), torch.cuda.amp.autocast(
         enabled=torch.cuda.is_available()
     ):
-        for j, img in enumerate(batch_imgs):
+        # --- LÍNEA MODIFICADA ---
+        # Envuelve batch_imgs con tqdm para mostrar una barra de progreso
+        for j, img in enumerate(tqdm.tqdm(batch_imgs, desc="Procesando imágenes (inferencia)")):
             dets: sv.Detections = detic_model.predict(img)
             confs = np.asarray(dets.confidence)
             if confs.size:

@@ -82,24 +82,3 @@ def glasses_detector(path: str):
 
     # Si hay un píxel blanco (255) en la columna central, interpretamos que hay un puente => gafas
     return 1 if 255 in center_col else 0
-
-
-if __name__ == "__main__":
-    # --- Ejemplo de uso ---
-    # Reemplaza con la ruta a tu imagen.
-    # Asegúrate de tener los archivos .dat en una carpeta llamada 'models'
-    # al mismo nivel que este script.
-    try:
-        image_path = "tests/test_image.jpg"
-        result = glasses_detector(image_path)
-
-        if result == 'No face detected':
-            print("No se detectó ninguna cara en la imagen. 🤷")
-        elif result == 1:
-            print("Gafas detectadas ✔️")
-        else:
-            print("No se detectaron gafas ✖️")
-
-    except FileNotFoundError:
-        print(f"Error: No se encontró el archivo de imagen o un archivo de modelo (.dat).")
-        print("Asegúrate de que la ruta a la imagen es correcta y que los modelos 'mmod_human_face_detector.dat' y 'shape_predictor_68_face_landmarks.dat' están en la carpeta 'models'.")

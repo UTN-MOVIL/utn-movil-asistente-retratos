@@ -3,9 +3,9 @@ import concurrent.futures
 import os
 import io
 import sys
-import traceback
+import threading
 from queue import Queue
-from typing import List, Tuple
+from typing import List, Tuple, Any
 from tqdm import tqdm
 
 from google.oauth2.credentials import Credentials
@@ -13,13 +13,10 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
 
-from deteccion_lentes_v2 import (
-    get_glasses_probability,
-    get_glasses_probability_batch,
-    configurar_optimizaciones_gpu,
-    warm_up_modelo,
-    obtener_estadisticas_cache
-)
+# --- MODIFICACIÓN: Importar el nuevo detector ---
+# Se asume que el archivo deteccion_lentes_v2.py contiene tu función
+# y todas sus dependencias necesarias (dlib, numpy, cv2, etc.)
+from deteccion_lentes_v2 import glasses_detector
 
 from exportacion_datos_excel import (
     format_to_hyperlinks,
@@ -28,17 +25,13 @@ from exportacion_datos_excel import (
     get_file_count,
 )
 
-# ── Constantes Globales ───────────────────────────────────────────────────────
-UMBRAL_DETECCION_LENTES = 0.4486
-
 # ── Google Drive ──────────────────────────────────────────────────────────────
 SCOPES     = ["https://www.googleapis.com/auth/drive.readonly"]
 TOKEN_FILE = "token.json"
 CREDS_FILE = "credentials.json"
+CACHE_DIR  = "image_cache"
 
-# --- Constantes para el Caché ------------------------------------------------
-# <--- NUEVO: Directorio para almacenar las imágenes y no volver a bajarlas.
-CACHE_DIR = "image_cache"
+# --- MODIFICACIÓN: El umbral de probabilidad ya no es necesario ---
 
 def drive_service():
     if os.path.exists(TOKEN_FILE):
@@ -100,14 +93,17 @@ def download_file_optimized(file_id: str, dest_path: str, drive, chunk_size: int
 
 def download_files_parallel(
     files: List[Tuple[str, str]],
-    download_dir: str, # <--- Renombrado para mayor claridad
+    temp_dir: str,
     drive_service_func,
     max_workers: int = 4
 ) -> List[str]:
     valid_ext = {'.jpg','.jpeg','.png','.bmp','.tiff','.webp'}
-    # Nota: El filtrado de 'valid_files' ahora se hace en la función principal
-    if not files:
-        print("[WARNING] No hay imágenes válidas para descargar.")
+    valid_files = [
+        (fid, name) for fid, name in files
+        if any(name.lower().endswith(ext) for ext in valid_ext)
+    ]
+    if not valid_files:
+        print("[WARNING] No hay imágenes válidas para descargar")
         return []
 
     image_paths = []
@@ -115,35 +111,24 @@ def download_files_parallel(
 
     def _download_task(file_id: str, name: str):
         drive = drive_service_func()
-        local_path = os.path.join(download_dir, name)
+        local_path = os.path.join(temp_dir, name)
         try:
             download_file_optimized(file_id, local_path, drive)
-            # VERIFY that the downloaded file is not empty
-            if os.path.getsize(local_path) == 0:
-                raise IOError(f"Archivo descargado '{name}' está vacío (0 bytes).")
             return local_path
         except Exception as e:
-            # IMPORTANT: If an error occurs, delete the partial/empty file
-            if os.path.exists(local_path):
-                try:
-                    os.remove(local_path)
-                except OSError:
-                    pass # Ignore errors on deletion
             raise RuntimeError(f"Error al descargar '{name}': {e}") from e
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_to_name = {
             executor.submit(_download_task, fid, name): name
-            for fid, name in files
+            for fid, name in valid_files
         }
-
         progress_bar = tqdm(
             concurrent.futures.as_completed(future_to_name),
-            total=len(files),
+            total=len(valid_files),
             desc="Descargando",
             unit="archivo"
         )
-
         for future in progress_bar:
             try:
                 path = future.result()
@@ -151,28 +136,22 @@ def download_files_parallel(
             except Exception as e:
                 print(f"[ERROR] {e}")
                 errors += 1
-            
             progress_bar.set_postfix(exitosos=len(image_paths), errores=errors)
 
     print(f"[INFO] Descarga completa: {len(image_paths)} éxitos, {errors} errores")
     return image_paths
 
-# ── Versión optimizada con descarga paralela Y CACHÉ MEJORADO ──────────────────
-def process_drive_folder_optimized(
+# ── Procesamiento principal con el nuevo detector ──────────────────────────
+def process_drive_folder_with_detector_v2(
     drive_folder_path: str,
-    usar_batch: bool = True,
-    umbral_minimo: float = 0.0,
     max_workers: int = 4,
     forzar_descarga: bool = False
-) -> Tuple[List[str], List[float]]:
+) -> Tuple[List[str], List[Any]]:
     """
-    Procesa imágenes de una carpeta de Drive, usando un caché local para
-    evitar descargas repetidas de archivos ya existentes.
+    Procesa imágenes de Drive con el detector v2, usando caché local.
     """
-    print("[INFO] 🚀 Iniciando procesamiento ultra-optimizado...")
-    configurar_optimizaciones_gpu()
-    warm_up_modelo()
-
+    print("[INFO] 🚀 Iniciando procesamiento con detector v2...")
+    
     drive = drive_service()
     folder_id = get_folder_id_by_path(drive_folder_path, drive)
     
@@ -181,19 +160,16 @@ def process_drive_folder_optimized(
     if not remote_files:
         print("[ERROR] No se encontraron archivos en la carpeta de Drive.")
         return [], []
-
     print(f"[INFO] Encontrados {len(remote_files)} archivos en Drive.")
     
-    # --- LÓGICA DE CACHÉ MEJORADA ---
-    os.makedirs(CACHE_DIR, exist_ok=True) 
-
+    # --- LÓGICA DE CACHÉ (sin cambios) ---
+    os.makedirs(CACHE_DIR, exist_ok=True)
     valid_ext = {'.jpg','.jpeg','.png','.bmp','.tiff','.webp'}
     remote_image_files = [
         (fid, name) for fid, name in remote_files 
         if any(name.lower().endswith(ext) for ext in valid_ext)
     ]
 
-    # Si se fuerza la descarga, vaciamos la carpeta de caché primero
     if forzar_descarga:
         print("[INFO] ⚠️ Forzando nueva descarga. Limpiando caché local...")
         for f in os.listdir(CACHE_DIR):
@@ -202,23 +178,19 @@ def process_drive_folder_optimized(
             except OSError as e:
                 print(f"[WARNING] No se pudo eliminar {f} del caché: {e}")
 
-    # Creamos dos listas: una para los archivos que ya tenemos y otra para los que faltan
     files_to_download = []
     cached_image_paths = []
-
     print("[INFO] 🔎 Verificando caché local...")
     for file_id, file_name in remote_image_files:
         local_path = os.path.join(CACHE_DIR, file_name)
         if os.path.exists(local_path) and not forzar_descarga:
             cached_image_paths.append(local_path)
         else:
-            # Si no existe localmente o se fuerza la descarga, lo añadimos a la cola
             files_to_download.append((file_id, file_name))
 
     if cached_image_paths:
         print(f"[INFO] ✅ {len(cached_image_paths)} archivos encontrados en el caché.")
 
-    # Descargamos solo los archivos que no están en el caché
     if files_to_download:
         print(f"[INFO] 📥 Se descargarán {len(files_to_download)} archivos nuevos o faltantes.")
         downloaded_paths = download_files_parallel(
@@ -229,7 +201,6 @@ def process_drive_folder_optimized(
         print("[INFO] ✅ El caché local ya está completo. No se necesitan descargas.")
         image_paths = cached_image_paths
 
-    # Ordenamos la lista final para mantener consistencia
     image_paths.sort()
 
     if not image_paths:
@@ -237,100 +208,87 @@ def process_drive_folder_optimized(
         return [], []
 
     print(f"[INFO] ✅ Listas {len(image_paths)} imágenes para procesar.")
-    print("[INFO] 🔍 Iniciando detección de lentes...")
+    
+    # --- MODIFICACIÓN: FASE 2: Detección con glasses_detector ---
+    print("[INFO] 🔍 Iniciando detección de lentes (método v2)...")
+    detection_results: List[Any] = []
+    for path in tqdm(image_paths, desc="Detectando lentes (v2)", unit="imagen"):
+        try:
+            # Llamada a la nueva función importada
+            result = glasses_detector(path)
+            detection_results.append(result)
+        except Exception as e:
+            # Captura cualquier error inesperado del detector
+            print(f"[ERROR] Procesando {os.path.basename(path)}: {e}")
+            detection_results.append('Error de procesamiento')
 
-    # --- FASE 2: Detección ---
-    if usar_batch and len(image_paths) > 1:
-        glasses_probs = get_glasses_probability_batch(image_paths)
-        pos = sum(1 for p in glasses_probs if isinstance(p, (int, float)) and p >= UMBRAL_DETECCION_LENTES)
-        print(f"[INFO] ✅ Batch completado ({pos}/{len(glasses_probs)} positivos)")
-    else:
-        glasses_probs: List[float] = []
-        for path in tqdm(image_paths, desc="Detectando lentes", unit="imagen"):
-            try:
-                glasses_probs.append(get_glasses_probability(path))
-            except Exception as e:
-                print(f"[ERROR] {path}: {e}")
-                glasses_probs.append(0.0)
-
-    # --- FASE 3: Estadísticas finales ---
+    # --- MODIFICACIÓN: FASE 3: Estadísticas finales adaptadas ---
     print("\n[INFO] 📈 Estadísticas finales:")
-    obtener_estadisticas_cache()
-
-    numeric_probs = [p for p in glasses_probs if isinstance(p, (int, float))]
-    total = len(numeric_probs)
-
+    total = len(detection_results)
     if total > 0:
-        con_lentes = sum(1 for p in numeric_probs if p >= UMBRAL_DETECCION_LENTES)
-        sin_lentes = total - con_lentes
-        prom = sum(numeric_probs) / total
+        con_lentes = detection_results.count(1)
+        sin_lentes = detection_results.count(0)
+        sin_rostro = detection_results.count('No face detected')
+        errores = total - (con_lentes + sin_lentes + sin_rostro)
         
         porc_con_lentes = (con_lentes / total) * 100
         porc_sin_lentes = (sin_lentes / total) * 100
+        porc_sin_rostro = (sin_rostro / total) * 100
 
         print(f"👓 Con lentes: {con_lentes} ({porc_con_lentes:.1f}%)")
         print(f"👁️ Sin lentes: {sin_lentes} ({porc_sin_lentes:.1f}%)")
-        print(f"📊 Promedio: {prom:.3f}")
+        print(f"❓ Sin rostro detectado: {sin_rostro} ({porc_sin_rostro:.1f}%)")
+        if errores > 0:
+            print(f"💥 Errores: {errores}")
     else:
-        print("⚠️ No se procesaron imágenes de forma exitosa. No se pueden calcular estadísticas.")
+        print("⚠️ No se procesaron imágenes. No se pueden calcular estadísticas.")
 
-    return image_paths, glasses_probs
-
-# ── Interfaz compatible ──────────────────────────────────────────────────────
-def process_drive_folder(drive_folder_path: str) -> Tuple[List[str], List[float]]:
-    return process_drive_folder_optimized(drive_folder_path, usar_batch=True)
+    return image_paths, detection_results
 
 # ── Main ─────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
+    # --- CONFIGURACIÓN ---
     dataset_drive_path = (
         "/Mi unidad/INGENIERIA_EN_SOFTWARE/5to_Semestre/"
         "PRACTICAS/Primera_Revision/"
         "validator/results/sin_procesar"
     )
-    USAR_BATCH = True
-    UMBRAL_MIN = 0.0
     MAX_THREADS = 6
-    # <--- NUEVO: Parámetro para forzar la descarga
-    FORZAR_NUEVA_DESCARGA = False
-
+    
     os.makedirs("results", exist_ok=True)
 
     try:
-        paths, probs = process_drive_folder_optimized(
+        # --- MODIFICACIÓN: Llamar a la nueva función principal ---
+        paths, results = process_drive_folder_with_detector_v2(
             dataset_drive_path,
-            usar_batch=USAR_BATCH,
-            umbral_minimo=UMBRAL_MIN,
-            max_workers=MAX_THREADS,
-            forzar_descarga=FORZAR_NUEVA_DESCARGA # <--- Uso del nuevo parámetro
+            max_workers=MAX_THREADS
         )
         if not paths:
             sys.exit(1)
-
-        ordered_probs = [probs[p] for p in paths] if isinstance(probs, dict) else probs
+            
+        # --- MODIFICACIÓN: Crear diccionario de resultados para el Excel ---
+        def format_result(r):
+            if r == 1: return "SÍ"
+            if r == 0: return "NO"
+            return str(r).replace('_', ' ').upper() # Formatea 'No face detected' y otros errores
 
         info = {
             "Rutas": format_to_hyperlinks(paths),
-            "Probabilidad": ordered_probs, # Now this is a list, as expected
-            "Detección": [
-                "SÍ" if isinstance(p, (int, float)) and p >= UMBRAL_DETECCION_LENTES 
-                else "NO" 
-                for p in ordered_probs # Iterate over the new list
-            ]
+            "Resultado_Raw": results,
+            "Deteccion_Lentes": [format_result(r) for r in results]
         }
         normalized = normalize_dict_lengths(info)
-        out = dict_to_excel(
-            normalized,
-            f"results/Reporte_{get_file_count('results')+1}.xlsx"
-        )
-        print(f"✅ Listo. Excel generado en: {out}")
+        
+        output_path = f"results/Reporte_v2_{get_file_count('results')+1}.xlsx"
+        out = dict_to_excel(normalized, output_path)
+        
+        print(f"✅ ¡Listo! Reporte de Excel generado en: {out}")
+        
     except KeyboardInterrupt:
-        print("\n[INFO] Interrumpido por usuario")
+        print("\n[INFO] Interrumpido por el usuario.")
         sys.exit(0)
-    except FileNotFoundError as e:
-        print(f"\n[ERROR DE RUTA] No se pudo encontrar una carpeta en Google Drive: {e}")
-        sys.exit(1)
     except Exception as e:
-        print(f"\n[ERROR INESPERADO] Se ha producido un error. Detalles:")
-        # 2. Imprimir la traza completa del error
+        print(f"\n[ERROR FATAL] Un error inesperado ocurrió: {e}")
+        import traceback
         traceback.print_exc()
         sys.exit(1)

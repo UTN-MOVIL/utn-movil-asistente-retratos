@@ -248,7 +248,7 @@ if __name__ == "__main__":
     dataset_drive_path = (
         "/Mi unidad/INGENIERIA_EN_SOFTWARE/6to_Semestre/"
         "PRACTICAS/Practicas-FOTOS/Primera_Revision/"
-        "validator/results/validated_color"
+        "validator/results/sin_procesar"
     )
     USAR_BATCH = True
     UMBRAL_MIN = 0.0

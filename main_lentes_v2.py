@@ -286,9 +286,9 @@ if __name__ == "__main__":
         print(f"\n[ERROR DE RUTA] No se pudo encontrar una carpeta en Google Drive: {e}")
         sys.exit(1)
     except Exception as e:
-    print(f"\n[ERROR INESPERADO] Se ha producido un error. Detalles:")
-    # 2. Imprimir la traza completa del error
-    traceback.print_exc()
-    
-    limpiar_cache_imagenes()
-    sys.exit(1)
+        print(f"\n[ERROR INESPERADO] Se ha producido un error. Detalles:")
+        # 2. Imprimir la traza completa del error
+        traceback.print_exc()
+        
+        limpiar_cache_imagenes()
+        sys.exit(1)

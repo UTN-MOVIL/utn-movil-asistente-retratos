@@ -165,7 +165,7 @@ def warm_up_modelo():
         print(f"[ERROR] Falló el calentamiento del modelo: {e}")
 
 # ────────────────────── 5. API Principal ───────────────────────────
-def get_glasses_probability(path: str) -> Union[float, str]:
+def get_glasses_probability(path: str) -> float: # <--- Change type hint to float
     """
     Estima la probabilidad de que haya gafas en una única imagen.
     Optimizado con múltiples capas de caché.
@@ -188,7 +188,7 @@ def get_glasses_probability(path: str) -> Union[float, str]:
 
         if landmarks is None:
             _result_cache[img_hash] = 0.0
-            return 'No face detected'
+            return 0.0  # <--- FIX 1: Was 'No face detected'
 
         # Para el cálculo, se necesita la imagen original (podría no estar en caché de imagen)
         img_rgb_for_calc = _load_image_optimized(path)
@@ -198,10 +198,11 @@ def get_glasses_probability(path: str) -> Union[float, str]:
         return glasses_prob
 
     except (FileNotFoundError, IOError) as e:
-        return str(e)
+        print(f"[WARN] Error de archivo procesando {path}: {e}")
+        return 0.0 # <--- FIX 2: Was str(e)
     except Exception as e:
         print(f"[ERROR] Error inesperado procesando {path}: {e}")
-        return "Processing error"
+        return 0.0 # <--- FIX 3: Was "Processing error"
 
 def get_glasses_probability_batch(
     rutas_imagenes: List[str],

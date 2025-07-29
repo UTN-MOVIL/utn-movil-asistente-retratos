@@ -118,8 +118,17 @@ def download_files_parallel(
         local_path = os.path.join(download_dir, name)
         try:
             download_file_optimized(file_id, local_path, drive)
+            # VERIFY that the downloaded file is not empty
+            if os.path.getsize(local_path) == 0:
+                raise IOError(f"Archivo descargado '{name}' está vacío (0 bytes).")
             return local_path
         except Exception as e:
+            # IMPORTANT: If an error occurs, delete the partial/empty file
+            if os.path.exists(local_path):
+                try:
+                    os.remove(local_path)
+                except OSError:
+                    pass # Ignore errors on deletion
             raise RuntimeError(f"Error al descargar '{name}': {e}") from e
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:

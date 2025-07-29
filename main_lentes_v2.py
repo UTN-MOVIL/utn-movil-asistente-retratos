@@ -282,7 +282,7 @@ if __name__ == "__main__":
     UMBRAL_MIN = 0.0
     MAX_THREADS = 6
     # <--- NUEVO: Parámetro para forzar la descarga
-    FORZAR_NUEVA_DESCARGA = False
+    FORZAR_NUEVA_DESCARGA = True
 
     os.makedirs("results", exist_ok=True)
 

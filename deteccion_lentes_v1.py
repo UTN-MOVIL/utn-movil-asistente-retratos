@@ -249,15 +249,6 @@ def procesar_lote_imagenes(
 
     return resultados
 
-
-# ────────────────────────── utilidades varias ────────────────────────────────
-def limpiar_cache_imagenes():
-    _image_cache.clear()
-    _preprocessed_cache.clear()
-    _result_cache.clear()
-    print("[INFO] Todos los cachés limpiados")
-
-
 def obtener_estadisticas_cache():
     import sys
 
@@ -305,7 +296,6 @@ if __name__ == "__main__":
         "  • verificar_presencia_de_lentes(ruta, umbral)\n"
         "  • procesar_lote_imagenes(rutas, umbral, usar_batch=True)\n"
         "  • obtener_estadisticas_cache()\n"
-        "  • limpiar_cache_imagenes()\n"
         "  • configurar_optimizaciones_gpu()\n"
         "  • warm_up_modelo()"
     )

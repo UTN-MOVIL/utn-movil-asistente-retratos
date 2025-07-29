@@ -261,14 +261,6 @@ def get_glasses_probability_batch(
 
     return resultados
 
-# ────────────────── 6. Utilidades de gestión de caché ───────────────────────
-def limpiar_cache_imagenes():
-    """Limpia todos los cachés en memoria."""
-    _image_cache.clear()
-    _landmarks_cache.clear()
-    _result_cache.clear()
-    print("[INFO] ✅ Todos los cachés han sido limpiados.")
-
 def obtener_estadisticas_cache():
     """Imprime el estado actual de los cachés."""
     print("[INFO] Estadísticas de caché:")

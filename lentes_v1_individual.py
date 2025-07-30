@@ -23,7 +23,7 @@ if __name__ == "__main__":
 
     # 3. Especificar la ruta a tu imagen local
     # ⬇️⬇️⬇️ CAMBIA ESTA LÍNEA POR LA RUTA DE TU IMAGEN ⬇️⬇️⬇️
-    ruta_imagen_local = r"tests\test_image.jpg" 
+    ruta_imagen_local = r"\tests\test_image.jpg" 
     # Ejemplos:
     # - En Windows: "C:\\Users\\TuUsuario\\Fotos\\mi_foto.png"
     # - En macOS/Linux: "/home/usuario/imagenes/selfie.jpg"

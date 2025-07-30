@@ -166,8 +166,6 @@ def get_glasses_probability_batch(
     resultados: List[float] = [0.0] * len(rutas)
 
     batch_imgs, idxs = [], []
-    # Opcional: también puedes monitorear la carga de imágenes
-    # for i, ruta in enumerate(tqdm(rutas, desc="Cargando imágenes")):
     for i, ruta in enumerate(rutas):
         try:
             img = _load_image_optimized(ruta)
@@ -183,9 +181,7 @@ def get_glasses_probability_batch(
     with torch.inference_mode(), torch.cuda.amp.autocast(
         enabled=torch.cuda.is_available()
     ):
-        # --- LÍNEA MODIFICADA ---
-        # Envuelve batch_imgs con tqdm para mostrar una barra de progreso
-        for j, img in enumerate(tqdm.tqdm(batch_imgs, desc="Procesando imágenes (inferencia)")):
+        for j, img in enumerate(batch_imgs):
             dets: sv.Detections = detic_model.predict(img)
             confs = np.asarray(dets.confidence)
             if confs.size:
@@ -249,6 +245,15 @@ def procesar_lote_imagenes(
 
     return resultados
 
+
+# ────────────────────────── utilidades varias ────────────────────────────────
+def limpiar_cache_imagenes():
+    _image_cache.clear()
+    _preprocessed_cache.clear()
+    _result_cache.clear()
+    print("[INFO] Todos los cachés limpiados")
+
+
 def obtener_estadisticas_cache():
     import sys
 
@@ -296,6 +301,7 @@ if __name__ == "__main__":
         "  • verificar_presencia_de_lentes(ruta, umbral)\n"
         "  • procesar_lote_imagenes(rutas, umbral, usar_batch=True)\n"
         "  • obtener_estadisticas_cache()\n"
+        "  • limpiar_cache_imagenes()\n"
         "  • configurar_optimizaciones_gpu()\n"
         "  • warm_up_modelo()"
     )

@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-
 # glasses_detector.py
 
 import numpy as np
@@ -59,3 +58,16 @@ def glasses_detector(path: str):
 
     # Si hay píxel blanco (255), interpretamos puente => gafas
     return 1 if 255 in center_col else 0
+
+
+if __name__ == "__main__":
+    # Ejemplo de uso: reemplaza con la ruta a tu imagen
+    image_path = r'C:\Users\Administrador\Documents\INGENIERIA_EN_SOFTWARE\PROYECTO_FOTOGRAFIAS_ESTUDIANTES\datasets\validated_color\0202032710.jpg'
+    result = glasses_detector(image_path)
+
+    if result == 'No face detected':
+        print("No se detectó ninguna cara en la imagen.")
+    elif result == 1:
+        print("Gafas detectadas ✔️")
+    else:
+        print("No se detectaron gafas ✖️")

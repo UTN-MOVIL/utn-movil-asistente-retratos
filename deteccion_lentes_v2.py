@@ -12,7 +12,7 @@ from PIL import Image
 detector = dlib.get_frontal_face_detector()
 
 # Ruta portátil al modelo de 68 puntos de referencia faciales
-BASE_DIR = Path(__file__).resolve().parent.parent.parent           # carpeta donde está este script
+BASE_DIR = Path(__file__).resolve().parent           # carpeta donde está este script
 MODEL_PATH = BASE_DIR / "models" / "shape_predictor_68_face_landmarks.dat"
 predictor = dlib.shape_predictor(str(MODEL_PATH))
 

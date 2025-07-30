@@ -70,7 +70,7 @@ def glasses_detector(path: str):
 
 if __name__ == "__main__":
     # Ejemplo de uso: reemplaza con la ruta a tu imagen
-    image_path = "/kaggle/working/funcionalidades_validador_retratos/tests/test_image.jpg"
+    image_path = r"C:\Users\Administrador\Documents\INGENIERIA_EN_SOFTWARE\TESIS\CODIGO\funcionalidades_validador_retratos\results\image_cache\0401775143.jpg"
     
     # Desempaqueta el resultado y el tiempo de inferencia
     result, inference_time = glasses_detector(image_path)

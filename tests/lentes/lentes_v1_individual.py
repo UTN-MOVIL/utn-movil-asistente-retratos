@@ -24,7 +24,7 @@ if __name__ == "__main__":
 
     # 3. Especificar la ruta a tu imagen local
     # ⬇️⬇️⬇️ CAMBIA ESTA LÍNEA POR LA RUTA DE TU IMAGEN ⬇️⬇️⬇️
-    ruta_imagen_local = "/kaggle/working/funcionalidades_validador_retratos/tests/test_image.jpg"
+    ruta_imagen_local = r"C:\Users\Administrador\Documents\INGENIERIA_EN_SOFTWARE\TESIS\CODIGO\funcionalidades_validador_retratos\results\image_cache\0401775143.jpg"
     # Ejemplos:
     # - En Windows: "C:\\Users\\TuUsuario\\Fotos\\mi_foto.png"
     # - En macOS/Linux: "/home/usuario/imagenes/selfie.jpg"

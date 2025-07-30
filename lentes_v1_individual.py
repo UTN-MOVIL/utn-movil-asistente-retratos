@@ -16,7 +16,7 @@ from deteccion_lentes_v1 import (
 if __name__ == "__main__":
     # 1. Configurar el detector. Cambia a `False` si prefieres usar CPU.
     # Si dlib no tiene soporte CUDA, cambiará a CPU automáticamente.
-    configurar_optimizaciones_gpu(use_gpu=True)
+    configurar_optimizaciones_gpu()
 
     # 2. (Opcional pero recomendado) Calentar el modelo para inferencia rápida.
     warm_up_modelo()

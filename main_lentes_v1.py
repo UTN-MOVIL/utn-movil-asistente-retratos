@@ -15,7 +15,7 @@ Requisitos
 pip install kaggle tqdm numpy
 # y tu módulo `exportacion_datos_excel` en PYTHONPATH
 """
-
+from google.colab import files
 import os
 import glob
 import pathlib
@@ -64,6 +64,22 @@ def descargar_val(dest: str = DESTDIR) -> str:
         raise FileNotFoundError("No se encontró la carpeta 'val/' tras descomprimir.")
     return val_dir
 
+def download_colab_file(filepath):
+  """
+  Downloads a file from the Google Colab environment to your local machine.
+
+  Args:
+    filepath (str): The path to the file you want to download.
+  """
+  if not os.path.exists(filepath):
+    print(f"Error: File not found at '{filepath}'")
+    return
+
+  try:
+    files.download(filepath)
+    print(f"File '{os.path.basename(filepath)}' download has been initiated.")
+  except Exception as e:
+    print(f"An error occurred during download: {e}")
 
 def evaluar(val_root: str) -> float:
     """Evalúa accuracy y genera un Excel con los resultados de cada imagen."""
@@ -108,6 +124,8 @@ def evaluar(val_root: str) -> float:
     dict_to_excel(normalized, nombre_excel)
 
     print(f"[INFO] 📄 Excel generado: {nombre_excel}")
+
+    download_colab_file(nombre_excel)
 
     return acc
 

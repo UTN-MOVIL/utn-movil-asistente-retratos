@@ -1,11 +1,12 @@
 # main_local.py
 
 import os
+import time  # Importado para medir el tiempo de ejecución
 
 # Asegúrate de que tu archivo 'deteccion_lentes_v2.py' esté en el mismo directorio
 # o sea accesible a través del PYTHONPATH.
 # Importar las funciones clave del módulo detector
-from deteccion_lentes_v1 import (
+from modulos import (
     configurar_optimizaciones_gpu,
     warm_up_modelo,
     get_glasses_probability,
@@ -23,7 +24,7 @@ if __name__ == "__main__":
 
     # 3. Especificar la ruta a tu imagen local
     # ⬇️⬇️⬇️ CAMBIA ESTA LÍNEA POR LA RUTA DE TU IMAGEN ⬇️⬇️⬇️
-    ruta_imagen_local = "/kaggle/working/funcionalidades_validador_retratos/tests/test_image.jpg" 
+    ruta_imagen_local = "/kaggle/working/funcionalidades_validador_retratos/tests/test_image.jpg"
     # Ejemplos:
     # - En Windows: "C:\\Users\\TuUsuario\\Fotos\\mi_foto.png"
     # - En macOS/Linux: "/home/usuario/imagenes/selfie.jpg"
@@ -32,13 +33,21 @@ if __name__ == "__main__":
     if os.path.exists(ruta_imagen_local):
         # 5. Obtener la probabilidad de que la persona en la imagen use lentes
         print(f"\n[INFO] Analizando la imagen local: {ruta_imagen_local}")
+        
+        # Iniciar cronómetro antes de la inferencia
+        start_time = time.time()
         resultado = get_glasses_probability(ruta_imagen_local)
+        # Detener cronómetro y calcular la duración
+        inference_time = time.time() - start_time
 
         # 6. Mostrar el resultado
         if isinstance(resultado, float):
             probabilidad_porcentaje = resultado * 100
             print("\n─────────── RESULTADO ───────────")
             print(f"🔬 Probabilidad de tener lentes: {probabilidad_porcentaje:.2f}%")
+            
+            # Mostrar el tiempo de inferencia calculado
+            print(f"⏱️ Tiempo de inferencia: {inference_time:.4f} segundos.")
             
             # Puedes ajustar este umbral según la precisión que observes
             if probabilidad_porcentaje > 30:
@@ -49,6 +58,8 @@ if __name__ == "__main__":
         else:
             # Manejar errores como 'No face detected' o si el archivo no es una imagen válida
             print(f"\n[AVISO] No se pudo procesar la imagen: {resultado}")
+            # Mostrar el tiempo incluso si hubo un error en el análisis
+            print(f"⏱️ Tiempo de ejecución: {inference_time:.4f} segundos.")
         
         # 7. Ver estadísticas del caché (opcional)
         print("\n")

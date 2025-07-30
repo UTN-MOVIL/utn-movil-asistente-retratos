@@ -4,32 +4,36 @@
 import numpy as np
 import dlib
 import cv2
+import time  # Importado para medir el tiempo
 from pathlib import Path
 from PIL import Image
 
 # --- Carga de modelos ---
-BASE_DIR = Path(__file__).resolve().parent
-MODEL_CNN_PATH = BASE_DIR / "models" / "mmod_human_face_detector.dat"
-detector = dlib.cnn_face_detection_model_v1(str(MODEL_CNN_PATH))
+detector = dlib.get_frontal_face_detector()
 
 # Ruta portátil al modelo de 68 puntos de referencia faciales
+BASE_DIR = Path(__file__).resolve().parent.parent.parent
 MODEL_PATH = BASE_DIR / "models" / "shape_predictor_68_face_landmarks.dat"
 predictor = dlib.shape_predictor(str(MODEL_PATH))
+
 
 def glasses_detector(path: str):
     """
     Detecta si en la imagen indicada hay gafas basándose en la presencia
     de un puente nasal en los bordes centrados del recorte de la zona nasal.
-    Devuelve:
-      - 'No face detected' si no encuentra cara
-      - 1 si detecta gafas
-      - 0 si no detecta gafas
+    Devuelve una tupla con el resultado y el tiempo de inferencia:
+      - ('No face detected', tiempo) si no encuentra cara
+      - (1, tiempo) si detecta gafas
+      - (0, tiempo) si no detecta gafas
     """
+    start_time = time.time()  # Inicia el cronómetro
+
     # Carga la imagen en formato RGB compatible con dlib
     img = dlib.load_rgb_image(path)
     faces = detector(img)
     if len(faces) == 0:
-        return 'No face detected'
+        inference_time = time.time() - start_time
+        return 'No face detected', inference_time
 
     # Tomamos la primera cara detectada
     rect = faces[0]
@@ -58,13 +62,18 @@ def glasses_detector(path: str):
     center_col = edges.T[len(edges.T) // 2]
 
     # Si hay píxel blanco (255), interpretamos puente => gafas
-    return 1 if 255 in center_col else 0
+    result = 1 if 255 in center_col else 0
+    
+    inference_time = time.time() - start_time  # Calcula el tiempo total
+    return result, inference_time
 
 
 if __name__ == "__main__":
     # Ejemplo de uso: reemplaza con la ruta a tu imagen
     image_path = "/kaggle/working/funcionalidades_validador_retratos/tests/test_image.jpg"
-    result = glasses_detector(image_path)
+    
+    # Desempaqueta el resultado y el tiempo de inferencia
+    result, inference_time = glasses_detector(image_path)
 
     if result == 'No face detected':
         print("No se detectó ninguna cara en la imagen.")
@@ -72,3 +81,6 @@ if __name__ == "__main__":
         print("Gafas detectadas ✔️")
     else:
         print("No se detectaron gafas ✖️")
+        
+    # Imprime el tiempo de inferencia formateado a 4 decimales
+    print(f"⏱️ Tiempo de inferencia: {inference_time:.4f} segundos.")

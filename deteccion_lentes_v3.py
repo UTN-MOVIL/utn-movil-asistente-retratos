@@ -27,4 +27,4 @@ def glasses_detect(path):
 
 # 1) Put your image’s location in a variable
 img_path = r"/kaggle/working/funcionalidades_validador_retratos/tests/test_image.jpg"
-print(glasses_detector(img_path))      # → 'present' or 'absent'
+print(glasses_detect(img_path))      # → 'present' or 'absent'

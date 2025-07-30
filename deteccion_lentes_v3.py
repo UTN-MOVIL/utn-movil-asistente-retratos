@@ -4,7 +4,7 @@
 from glasses_detector import GlassesClassifier
 from PIL import Image
 
-def glasses_detector(path):
+def glasses_detect(path):
     """
     Detects if spectacles are present in the image at the given path.
     
@@ -23,7 +23,7 @@ def glasses_detector(path):
     # 3) Run the prediction
     prediction = clf(image)  # or simply clf(path) if you prefer
 
-    return f"Spectacles detected: {prediction}"  # → 'present' or 'absent'
+    return prediction
 
 # # 1) Put your image’s location in a variable
 # img_path = r"C:\Users\Administrador\Documents\INGENIERIA_EN_SOFTWARE\TESIS\CODIGO\funcionalidades_validador_retratos\results\image_cache\.1720858651.jpg"

@@ -16,7 +16,7 @@ from googleapiclient.http import MediaIoBaseDownload
 # --- MODIFICACIÓN: Importar el nuevo detector ---
 # Se asume que el archivo deteccion_lentes_v3.py contiene tu función
 # y todas sus dependencias necesarias (dlib, numpy, cv2, etc.)
-from deteccion_lentes_v3 import glasses_detector
+from deteccion_lentes_v3 import glasses_detect
 
 from exportacion_datos_excel import (
     format_to_hyperlinks,
@@ -215,7 +215,7 @@ def process_drive_folder_with_detector_v2(
     for path in tqdm(image_paths, desc="Detectando lentes (v2)", unit="imagen"):
         try:
             # Llamada a la nueva función importada
-            result = glasses_detector(path)
+            result = glasses_detect(path)
             detection_results.append(result)
         except Exception as e:
             # Captura cualquier error inesperado del detector

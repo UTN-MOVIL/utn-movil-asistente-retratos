@@ -1,7 +1,7 @@
 # install (one-time)
 # pip install glasses-detector==1.0.3 pillow   # or newer
 
-from glasses_detector import GlassesClassifier
+from glasses_detector.detector import GlassesClassifier
 from PIL import Image
 
 def glasses_detect(path):

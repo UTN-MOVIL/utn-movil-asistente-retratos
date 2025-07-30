@@ -25,6 +25,6 @@ def glasses_detector(path):
 
     return f"Spectacles detected: {prediction}"  # → 'present' or 'absent'
 
-# 1) Put your image’s location in a variable
-img_path = r"C:\Users\Administrador\Documents\INGENIERIA_EN_SOFTWARE\TESIS\CODIGO\funcionalidades_validador_retratos\results\image_cache\.1720858651.jpg"
-print(glasses_detector(img_path))      # → 'present' or 'absent'
+# # 1) Put your image’s location in a variable
+# img_path = r"C:\Users\Administrador\Documents\INGENIERIA_EN_SOFTWARE\TESIS\CODIGO\funcionalidades_validador_retratos\results\image_cache\.1720858651.jpg"
+# print(glasses_detector(img_path))      # → 'present' or 'absent'

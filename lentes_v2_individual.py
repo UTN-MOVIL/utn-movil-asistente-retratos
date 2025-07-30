@@ -13,7 +13,6 @@ MODEL_CNN_PATH = BASE_DIR / "models" / "mmod_human_face_detector.dat"
 detector = dlib.cnn_face_detection_model_v1(str(MODEL_CNN_PATH))
 
 # Ruta portátil al modelo de 68 puntos de referencia faciales
-BASE_DIR = Path(__file__).resolve().parent.parent.parent           # carpeta donde está este script
 MODEL_PATH = BASE_DIR / "models" / "shape_predictor_68_face_landmarks.dat"
 predictor = dlib.shape_predictor(str(MODEL_PATH))
 

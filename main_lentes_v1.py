@@ -8,7 +8,7 @@ de tu detector de gafas sobre las imágenes de val/.
 Además, genera un Excel con:
   • Ruta de la imagen (hipervínculo)
   • Probabilidad devuelta por el modelo
-  • Detección (SÍ / NO) usando el umbral 0.45
+  • Detección (SÍ / NO) usando el umbral 0.4486
 
 Requisitos
 ----------
@@ -38,7 +38,7 @@ from exportacion_datos_excel import (  # noqa: E402
 # ── Parámetros del script ────────────────────────────────────────────────────
 DATASET   = "sehriyarmemmedli/glasses-vs-noglasses-dataset"
 DESTDIR   = "data"
-UMBRAL    = 0.45        # ≥ UMBRAL ⇒ “con gafas”
+UMBRAL    = 0.4486        # ≥ UMBRAL ⇒ “con gafas”
 BATCH     = 64          # tamaño de batch para inferencia
 RESULTS   = "results"   # carpeta de reportes Excel
 

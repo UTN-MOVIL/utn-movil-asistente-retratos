@@ -4,16 +4,27 @@
 from glasses_detector import GlassesClassifier
 from PIL import Image
 
+def glasses_detector(path):
+    """
+    Detects if spectacles are present in the image at the given path.
+    
+    Args:
+        path (str): The file path to the image.
+        
+    Returns:
+        str: 'present' if spectacles are detected, 'absent' otherwise.
+    """
+    # 1) Read the image
+    image = Image.open(path).convert("RGB")  # ensures the image is in RGB format
+
+    # 2) Load the pretrained binary classifier
+    clf = GlassesClassifier(kind="anyglasses", size="medium")  # binary: spectacles present / absent
+
+    # 3) Run the prediction
+    prediction = clf(image)  # or simply clf(path) if you prefer
+
+    return f"Spectacles detected: {prediction}"  # → 'present' or 'absent'
+
 # 1) Put your image’s location in a variable
-img_path = r"C:\Users\Administrador\Documents\INGENIERIA_EN_SOFTWARE\PROYECTO_FOTOGRAFIAS_ESTUDIANTES\datasets\validated_color\0104651666.jpg"
-
-# 2) Read the image
-image = Image.open(img_path).convert("RGB")     # makes sure it’s RGB
-
-# 3) Load the pretrained binary classifier
-clf = GlassesClassifier(kind="anyglasses", size="medium")  # binary: spectacles present / absent
-
-# 4) Run the prediction
-prediction = clf(image)        # or simply clf(img_path) if you prefer
-
-print(f"Spectacles detected: {prediction}")      # → 'present' or 'absent'
+img_path = r"C:\Users\Administrador\Documents\INGENIERIA_EN_SOFTWARE\TESIS\CODIGO\funcionalidades_validador_retratos\results\image_cache\.1720858651.jpg"
+print(glasses_detector(img_path))      # → 'present' or 'absent'

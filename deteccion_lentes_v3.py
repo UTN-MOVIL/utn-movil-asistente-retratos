@@ -1,7 +1,7 @@
 # install (one-time)
 # pip install glasses-detector==1.0.3 pillow   # or newer
 
-from glasses_detector.detector import GlassesClassifier
+from glasses_detector import GlassesClassifier
 from PIL import Image
 
 def glasses_detect(path):
@@ -25,6 +25,6 @@ def glasses_detect(path):
 
     return prediction
 
-# # 1) Put your image’s location in a variable
-# img_path = r"C:\Users\Administrador\Documents\INGENIERIA_EN_SOFTWARE\TESIS\CODIGO\funcionalidades_validador_retratos\results\image_cache\.1720858651.jpg"
-# print(glasses_detector(img_path))      # → 'present' or 'absent'
+# 1) Put your image’s location in a variable
+img_path = r"/kaggle/working/funcionalidades_validador_retratos/tests/test_image.jpg"
+print(glasses_detector(img_path))      # → 'present' or 'absent'

@@ -21,6 +21,7 @@ packages=(
     "openpyxl"
     "autodistill-detic"
     "supervision"
+    "scikit-learn"
 )
 
 # Instalar cada paquete usando python3.11

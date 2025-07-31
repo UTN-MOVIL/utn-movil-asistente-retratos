@@ -1,8 +1,10 @@
+#!/usr/bin/env python3
 import os
-from typing import List, Tuple
 import io
 import threading
 import concurrent.futures
+from typing import List, Tuple
+
 from tqdm import tqdm
 from PIL import Image
 import cv2
@@ -12,6 +14,8 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseDownload
+
+
 # ── Google Drive ──────────────────────────────────────────────────────────────
 SCOPES     = ["https://www.googleapis.com/auth/drive.readonly"]
 TOKEN_FILE = "token.json"
@@ -20,7 +24,7 @@ CREDS_FILE = "credentials.json"
 MAX_CACHE_SIZE = 100
 _image_cache: dict[str, np.ndarray] = {}
 
-
+# ───────────────────────── Utils: cache & resize ──────────────────────────────
 def _get_image_hash(ruta_imagen: str) -> str:
     try:
         st = os.stat(ruta_imagen)
@@ -28,11 +32,11 @@ def _get_image_hash(ruta_imagen: str) -> str:
     except FileNotFoundError:
         return ruta_imagen
 
-
 def _load_image_optimized(ruta_imagen: str) -> np.ndarray:
     img_hash = _get_image_hash(ruta_imagen)
 
     if len(_image_cache) > MAX_CACHE_SIZE:
+        # Evict 20 % oldest keys
         for key in list(_image_cache)[: MAX_CACHE_SIZE // 5]:
             _image_cache.pop(key)
 
@@ -57,7 +61,12 @@ def _load_image_optimized(ruta_imagen: str) -> np.ndarray:
 
     return _image_cache[img_hash]
 
+# ─────────────────────── Google Drive helpers ────────────────────────────────
 def drive_service():
+    """Devuelve una instancia del cliente de Drive.
+
+    ⚡ OPT-1: cache_discovery=False evita descargar el documento de descubrimiento
+    en cada hilo, ahorrando ~300 KB y un round-trip por hilo. """
     if os.path.exists(TOKEN_FILE):
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
     else:
@@ -65,7 +74,8 @@ def drive_service():
         creds = flow.run_local_server(port=0)
         with open(TOKEN_FILE, "w") as f:
             f.write(creds.to_json())
-    return build("drive", "v3", credentials=creds)
+
+    return build("drive", "v3", credentials=creds, cache_discovery=False)  # OPT-1 ✔
 
 def get_folder_id_by_path(path: str, drive):
     segments  = [s for s in path.strip("/").split("/") if s and s != "Mi unidad"]
@@ -106,7 +116,13 @@ def list_files_recursive(folder_id: str, drive) -> List[Tuple[str, str]]:
             break
     return results
 
-def download_file_optimized(file_id: str, dest_path: str, drive, chunk_size: int = 10 * 1024 * 1024):
+# ⚡ OPT-2: chunk_size sube de 10 MB → 64 MB para reducir peticiones HTTP
+def download_file_optimized(
+    file_id: str,
+    dest_path: str,
+    drive,
+    chunk_size: int = 64 * 1024 * 1024  # 64 MB  ✔
+):
     request = drive.files().get_media(fileId=file_id)
     fh = io.FileIO(dest_path, "wb")
     downloader = MediaIoBaseDownload(fh, request, chunksize=chunk_size)
@@ -115,15 +131,16 @@ def download_file_optimized(file_id: str, dest_path: str, drive, chunk_size: int
         _, done = downloader.next_chunk()
     fh.close()
 
+# ─────────────────────── Descarga paralela ───────────────────────────────────
 thread_local = threading.local()
 
 def download_files_parallel(
     files: List[Tuple[str, str]],
     temp_dir: str,
     drive_service_func,
-    max_workers: int = 4
+    max_workers: int | None = None  # OPT-3: dinámico
 ) -> List[str]:
-    valid_ext = {'.jpg','.jpeg','.png','.bmp','.tiff','.webp'}
+    valid_ext = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.webp'}
     valid_files = [
         (fid, name) for fid, name in files
         if any(name.lower().endswith(ext) for ext in valid_ext)
@@ -132,28 +149,25 @@ def download_files_parallel(
         print("[WARNING] No hay imágenes válidas para descargar")
         return []
 
-    image_paths = []
+    if max_workers is None:                         # OPT-3 ✔
+        max_workers = min(8, len(valid_files))      # 6-8 hilos suele ser óptimo
+
+    image_paths: list[str] = []
     errors = 0
 
     def get_thread_local_drive_service():
-        """Creates or retrieves a Drive service instance unique to the current thread."""
         if not hasattr(thread_local, 'drive'):
-            # If this thread doesn't have a service object yet, create one
-            print(f"[DEBUG] Creando nueva sesión de Drive para el hilo: {threading.get_ident()}")
+            print(f"[DEBUG] Creando nueva sesión Drive en hilo {threading.get_ident()}")
             thread_local.drive = drive_service_func()
-        # Return the service object for this thread
         return thread_local.drive
 
     def _download_task(file_id: str, name: str):
-        """Downloads a single file using the thread-local Drive service."""
-        # Get the single, persistent Drive service for this thread
         drive = get_thread_local_drive_service()
         local_path = os.path.join(temp_dir, name)
         try:
             download_file_optimized(file_id, local_path, drive)
             return local_path
         except Exception as e:
-            # Using a thread-safe print or logging mechanism is better here if needed
             raise RuntimeError(f"Error al descargar '{name}': {e}") from e
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -179,49 +193,29 @@ def download_files_parallel(
     print(f"[INFO] Descarga completa: {len(image_paths)} éxitos, {errors} errores")
     return image_paths
 
+# ─────────────────────── Validación de imágenes ──────────────────────────────
 def check_and_delete_corrupted_image(image_path: str) -> bool:
-    """
-    Checks if an image is corrupted or excessively large (Decompression Bomb).
-    
-    If an issue is found, it prints a warning, deletes the file, and returns True.
-    Otherwise, it returns False.
-    """
     try:
-        _load_image_optimized(image_path)  # Attempt to load the image using the optimized function
+        _load_image_optimized(image_path)
         with Image.open(image_path) as img:
-            img.verify()  # Checks for file integrity.
-        return False  # Image is OK.
-
-    # --- THIS IS THE CORRECTED PART ---
+            img.verify()
+        return False
     except Exception:
-        # Catch the specific error for oversized images
         try:
             os.remove(image_path)
             print(f"[WARNING] Imagen corrupta o demasiado grande: {image_path}. Eliminada.")
         except OSError as e:
-            print(f"[ERROR] Could not delete file {image_path}: {e}")
-        return True # Signal that the file was problematic and handled.
-        
+            print(f"[ERROR] No se pudo eliminar {image_path}: {e}")
+        return True
+
 def process_image_list(image_paths: List[str]) -> int:
-    """
-    Processes a list of image paths, deleting any that are corrupted.
-
-    Args:
-        image_paths: A list of file paths to check.
-
-    Returns:
-        The total number of corrupted images that were deleted.
-    """
     deleted_count = 0
     total_images = len(image_paths)
-    
-    print(f"🚀 Starting to process {total_images} images...")
+    print(f"🚀 Analizando {total_images} imágenes...")
 
-    for i, path in enumerate(image_paths):
-        # The print statement is now inside check_and_delete_corrupted_image
+    for path in image_paths:
         if check_and_delete_corrupted_image(path):
             deleted_count += 1
-            
-    print(f"\n✨ Processing Complete!")
-    print(f"Checked: {total_images} | Deleted: {deleted_count}")
+
+    print(f"\n✨ Listo: Revisadas {total_images} | Eliminadas {deleted_count}")
     return deleted_count

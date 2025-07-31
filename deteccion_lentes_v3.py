@@ -25,8 +25,6 @@ def glasses_detect(path):
 
     return prediction
 
-# 1) Put your image’s location in a variable
-#img_path = r"/kaggle/working/funcionalidades_validador_retratos/tests/test_image.jpg"
-
-# img_path = r"tests/test_image.jpg"
-# print(glasses_detect(img_path))      # → 'present' or 'absent'
+# path = "C:\\Users\\Administrador\\Documents\\INGENIERIA_EN_SOFTWARE\\TESIS\\CODIGO\\funcionalidades_validador_retratos\\results\\image_cache\\0401794532.jpg"  # replace with your image path
+# result = glasses_detect(path)
+# print(f"Spectacles are {result}.")

@@ -288,3 +288,7 @@ def warm_up_modelo(iters: int = 3):
         dummy = np.random.randint(0, 255, (h, w, 3), dtype=np.uint8)
         detic_model.predict(dummy)
     print("[INFO] Modelo pre-calentado")
+
+# path = "C:\\Users\\Administrador\\Documents\\INGENIERIA_EN_SOFTWARE\\TESIS\\CODIGO\\funcionalidades_validador_retratos\\results\\image_cache\\0401794532.jpg"  # replace with your image path
+# result = verificar_presencia_de_lentes(path)
+# print(f"Lentes detectados: {result}")

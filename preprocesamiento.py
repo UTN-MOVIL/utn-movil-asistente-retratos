@@ -197,7 +197,7 @@ def download_files_parallel(
 def check_and_delete_corrupted_image(image_path: str) -> bool:
     try:
         _load_image_optimized(image_path)
-        with Image.open(image_path) as img:
+        with Image.open(image_path).convert("RGB") as img:
             img.verify()
         return False
     except Exception:

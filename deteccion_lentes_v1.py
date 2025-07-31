@@ -6,9 +6,9 @@ Requisitos:
     pip install autodistill-detic supervision opencv-python torch torchvision tqdm
     (y clonar el repo oficial de Detic en una sub-carpeta ./Detic)
 """
+from __future__ import annotations
 import matplotlib
 matplotlib.use('Agg')
-from __future__ import annotations
 
 import os
 import sys

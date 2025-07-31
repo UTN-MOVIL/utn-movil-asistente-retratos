@@ -167,9 +167,13 @@ if __name__ == "__main__":
             
         # --- MODIFICACIÓN: Crear diccionario de resultados para el Excel ---
         def format_result(r):
-            if r >= 0.4486: return "SÍ"
-            if r < 0.4486: return "NO"
-            return str(r).replace('_', ' ').upper() # Formatea 'No face detected' y otros errores
+            # First, check if 'r' is a number (float or int)
+            if isinstance(r, (float, int)):
+                if r >= 0.4486: return "SÍ"
+                return "NO"  # No need for the second 'if', it's the only other case
+            
+            # If it's not a number, it must be a string. Handle it here.
+            return str(r).replace('_', ' ').upper()
 
         info = {
             "Rutas": format_to_hyperlinks(paths),

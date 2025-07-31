@@ -7,6 +7,10 @@ Requisitos:
     (y clonar el repo oficial de Detic en una sub-carpeta ./Detic)
 """
 from __future__ import annotations
+import os
+# Clear the problematic environment variable
+if 'MPLBACKEND' in os.environ:
+    del os.environ['MPLBACKEND']
 import matplotlib
 matplotlib.use('Agg')
 

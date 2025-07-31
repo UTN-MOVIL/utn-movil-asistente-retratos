@@ -4,7 +4,7 @@ import io
 import threading
 import concurrent.futures
 from tqdm import tqdm
-from PIL import Image
+from PIL import Image, DecompressionBombError
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -141,40 +141,34 @@ def download_files_parallel(
 
 def check_and_delete_corrupted_image(image_path: str) -> bool:
     """
-    Reads an image from a path and deletes it if it's corrupted.
-
-    This function attempts to open and verify the image file. If Pillow
-    raises an exception (e.g., UnidentifiedImageError, IOError), the
-    file is considered corrupt and deleted.
-
-    Args:
-        image_path: The full path to the image file.
-
-    Returns:
-        True if the image was corrupted and deleted, False otherwise.
+    Checks if an image is corrupted or excessively large (Decompression Bomb).
+    
+    If an issue is found, it prints a warning, deletes the file, and returns True.
+    Otherwise, it returns False.
     """
-    if not os.path.exists(image_path):
-        print(f"File not found: {image_path}")
-        return False
-
     try:
-        # Open the image file.
         with Image.open(image_path) as img:
-            # The verify() method checks for file integrity without loading
-            # the full image data into memory.
-            img.verify()
-        print(f"✅ Image is valid: {image_path}")
-        return False
-    except (IOError, SyntaxError, Image.UnidentifiedImageError) as e:
-        print(f"❌ Corrupted image detected: {image_path}")
+            img.verify()  # Checks for file integrity.
+        return False  # Image is OK.
+
+    # --- THIS IS THE CORRECTED PART ---
+    except DecompressionBombError:
+        # Catch the specific error for oversized images
+        print(f"\n[WARNING] 💣 Decompression bomb detected! Deleting large image: {os.path.basename(image_path)}")
         try:
-            # Attempt to delete the corrupted file.
             os.remove(image_path)
-            print(f"🗑️ Deleted corrupted file: {image_path}")
-            return True
-        except OSError as e_del:
-            print(f"Error deleting file {image_path}: {e_del}")
-            return False
+        except OSError as e:
+            print(f"[ERROR] Could not delete file {image_path}: {e}")
+        return True # Signal that the file was problematic and handled.
+    
+    except (IOError, SyntaxError) as e:
+        # Catch other potential corruption errors
+        print(f"\n[WARNING] ⚠️ Corruption detected in {os.path.basename(image_path)}: {e}. Deleting file.")
+        try:
+            os.remove(image_path)
+        except OSError as e:
+            print(f"[ERROR] Could not delete file {image_path}: {e}")
+        return True # Signal that the file was problematic and handled.
         
 def process_image_list(image_paths: List[str]) -> int:
     """

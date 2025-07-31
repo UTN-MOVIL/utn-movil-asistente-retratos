@@ -178,7 +178,7 @@ if __name__ == "__main__":
         }
         normalized = normalize_dict_lengths(info)
         
-        output_path = f"results/Reporte_v2_{get_file_count('results')+1}.xlsx"
+        output_path = f"/content/drive/MyDrive/colab/Reporte_v2_{get_file_count('results')+1}.xlsx"
         out = dict_to_excel(normalized, output_path)
         
         print(f"✅ ¡Listo! Reporte de Excel generado en: {out}")

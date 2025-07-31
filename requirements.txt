@@ -1,0 +1,12 @@
+roboflow
+autodistill-detic
+supervision
+centernet2
+git+https://github.com/openai/CLIP.git
+XlsxWriter
+kaggle
+glasses-detector>=1.0.3
+google-api-python-client
+google-auth-oauthlib
+pandas
+openpyxl

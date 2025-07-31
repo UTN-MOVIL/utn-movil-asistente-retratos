@@ -11,7 +11,7 @@ openpyxl
 scikit-learn
 torch
 torchvision
-'git+https://github.com/facebookresearch/detectron2.git'
+git+https://github.com/facebookresearch/detectron2.git
 autodistill-detic
 supervision
 opencv-python

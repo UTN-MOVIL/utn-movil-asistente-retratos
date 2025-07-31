@@ -1,6 +1,4 @@
 roboflow
-autodistill-detic
-supervision
 centernet2
 git+https://github.com/openai/CLIP.git
 XlsxWriter
@@ -11,3 +9,10 @@ google-auth-oauthlib
 pandas
 openpyxl
 scikit-learn
+torch
+torchvision
+'git+https://github.com/facebookresearch/detectron2.git'
+autodistill-detic
+supervision
+opencv-python
+tqdm

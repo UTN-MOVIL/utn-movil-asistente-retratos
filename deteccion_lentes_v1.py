@@ -282,22 +282,3 @@ def warm_up_modelo(iters: int = 3):
         dummy = np.random.randint(0, 255, (h, w, 3), dtype=np.uint8)
         detic_model.predict(dummy)
     print("[INFO] Modelo pre-calentado")
-
-
-# ────────────────────────────── CLI simple ───────────────────────────────────
-if __name__ == "__main__":
-    configurar_optimizaciones_gpu()
-    warm_up_modelo()
-
-    print(
-        "\n[INFO] Script listo. Funciones disponibles:\n"
-        "  • get_glasses_probability(ruta, umbral_min)\n"
-        "  • get_glasses_probability_batch(rutas, umbral_min)\n"
-        "  • verificar_presencia_de_lentes(ruta, umbral)\n"
-        "  • procesar_lote_imagenes(rutas, umbral, usar_batch=True)\n"
-        "  • obtener_estadisticas_cache()\n"
-        "  • configurar_optimizaciones_gpu()\n"
-        "  • warm_up_modelo()"
-    )
-
-    obtener_estadisticas_cache()

@@ -98,17 +98,28 @@ def process_drive_folder_with_detector_v2(
     print(f"[INFO] ✅ Listas {len(image_paths)} imágenes para procesar.")
     
     # --- MODIFICACIÓN: FASE 2: Detección con glasses_detector ---
-    print("[INFO] 🔍 Iniciando detección de lentes (método v2)...")
+    print("[INFO] 🔍 Iniciando detección de lentes...")
     detection_results: List[Any] = []
-    for path in tqdm(image_paths, desc="Detectando lentes (v2)", unit="imagen"):
+
+    for path in tqdm(image_paths, desc="Detectando lentes", unit="imagen"):
         try:
-            # Llamada a la nueva función importada
+            # Intenta procesar la imagen como siempre
             result = glasses_detect(path)
             detection_results.append(result)
+
         except Exception as e:
-            # Captura cualquier error inesperado del detector
-            print(f"[ERROR] Procesando {os.path.basename(path)}: {e}")
-            detection_results.append('Error de procesamiento')
+            # SI OCURRE UN ERROR:
+            # 1. Informa del problema y que el archivo será eliminado.
+            print(f"\n[ERROR] Problema con '{os.path.basename(path)}': {e}. Eliminando archivo... 🗑️")
+            
+            # 2. Intenta eliminar el archivo del disco.
+            try:
+                os.remove(path)
+            except OSError as oe:
+                print(f"[WARNING] No se pudo eliminar el archivo {path}: {oe}")
+
+            # 3. Registra el error en tus resultados para el reporte final.
+            detection_results.append('Archivo corrupto y eliminado')
 
     # --- MODIFICACIÓN: FASE 3: Estadísticas finales adaptadas ---
     print("\n[INFO] 📈 Estadísticas finales:")

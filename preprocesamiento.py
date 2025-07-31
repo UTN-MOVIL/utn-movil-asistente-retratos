@@ -5,6 +5,8 @@ import threading
 import concurrent.futures
 from tqdm import tqdm
 from PIL import Image
+import cv2
+import numpy as np
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -15,7 +17,45 @@ SCOPES     = ["https://www.googleapis.com/auth/drive.readonly"]
 TOKEN_FILE = "token.json"
 CREDS_FILE = "credentials.json"
 
-# --- MODIFICACIÓN: El umbral de probabilidad ya no es necesario ---
+MAX_CACHE_SIZE = 100
+_image_cache: dict[str, np.ndarray] = {}
+
+
+def _get_image_hash(ruta_imagen: str) -> str:
+    try:
+        st = os.stat(ruta_imagen)
+        return f"{ruta_imagen}_{st.st_mtime}_{st.st_size}"
+    except FileNotFoundError:
+        return ruta_imagen
+
+
+def _load_image_optimized(ruta_imagen: str) -> np.ndarray:
+    img_hash = _get_image_hash(ruta_imagen)
+
+    if len(_image_cache) > MAX_CACHE_SIZE:
+        for key in list(_image_cache)[: MAX_CACHE_SIZE // 5]:
+            _image_cache.pop(key)
+
+    if img_hash not in _image_cache:
+        if not os.path.exists(ruta_imagen):
+            raise FileNotFoundError(f"Imagen no encontrada: {ruta_imagen}")
+
+        img = cv2.imread(ruta_imagen)
+        if img is None:
+            raise ValueError(f"No se pudo cargar la imagen: {ruta_imagen}")
+
+        h, w = img.shape[:2]
+        target = 640
+        if max(h, w) > target:
+            scale = target / max(h, w)
+            img = cv2.resize(
+                img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_LINEAR
+            )
+            print(f"[INFO] Redimensionada {ruta_imagen} a ≤{target}px")
+
+        _image_cache[img_hash] = img
+
+    return _image_cache[img_hash]
 
 def drive_service():
     if os.path.exists(TOKEN_FILE):
@@ -147,25 +187,17 @@ def check_and_delete_corrupted_image(image_path: str) -> bool:
     Otherwise, it returns False.
     """
     try:
+        _load_image_optimized(image_path)  # Attempt to load the image using the optimized function
         with Image.open(image_path) as img:
             img.verify()  # Checks for file integrity.
         return False  # Image is OK.
 
     # --- THIS IS THE CORRECTED PART ---
-    except Image.DecompressionBombError:
+    except Exception:
         # Catch the specific error for oversized images
-        print(f"\n[WARNING] 💣 Decompression bomb detected! Deleting large image: {os.path.basename(image_path)}")
         try:
             os.remove(image_path)
-        except OSError as e:
-            print(f"[ERROR] Could not delete file {image_path}: {e}")
-        return True # Signal that the file was problematic and handled.
-    
-    except (IOError, SyntaxError) as e:
-        # Catch other potential corruption errors
-        print(f"\n[WARNING] ⚠️ Corruption detected in {os.path.basename(image_path)}: {e}. Deleting file.")
-        try:
-            os.remove(image_path)
+            print(f"[WARNING] Imagen corrupta o demasiado grande: {image_path}. Eliminada.")
         except OSError as e:
             print(f"[ERROR] Could not delete file {image_path}: {e}")
         return True # Signal that the file was problematic and handled.

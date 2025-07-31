@@ -4,7 +4,7 @@ import io
 import threading
 import concurrent.futures
 from tqdm import tqdm
-from PIL import Image, DecompressionBombError
+from PIL import Image
 
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -152,7 +152,7 @@ def check_and_delete_corrupted_image(image_path: str) -> bool:
         return False  # Image is OK.
 
     # --- THIS IS THE CORRECTED PART ---
-    except DecompressionBombError:
+    except Image.DecompressionBombError:
         # Catch the specific error for oversized images
         print(f"\n[WARNING] 💣 Decompression bomb detected! Deleting large image: {os.path.basename(image_path)}")
         try:

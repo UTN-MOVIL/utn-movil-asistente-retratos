@@ -25,6 +25,6 @@ def glasses_detect(path):
 
     return prediction
 
-# path = "C:\\Users\\Administrador\\Documents\\INGENIERIA_EN_SOFTWARE\\TESIS\\CODIGO\\funcionalidades_validador_retratos\\results\\image_cache\\0401794532.jpg"  # replace with your image path
+# path = "C:\\Users\\Administrador\\Documents\\INGENIERIA_EN_SOFTWARE\\TESIS\\CODIGO\\funcionalidades_validador_retratos\\results\\image_cache\\0450159900.jpg"  # replace with your image path
 # result = glasses_detect(path)
 # print(f"Spectacles are {result}.")

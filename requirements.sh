@@ -22,6 +22,7 @@ packages=(
     "autodistill-detic"
     "supervision"
     "scikit-learn"
+    "mediapipe"
 )
 
 # Instalar cada paquete usando python3.11

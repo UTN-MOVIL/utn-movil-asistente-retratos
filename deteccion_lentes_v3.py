@@ -33,7 +33,6 @@ def get_glasses_probability(path, *, return_proba: bool = True, thresh: float = 
     else:
         return "present" if proba >= thresh else "absent"
 
-# Example
-path = r"C:\Users\Administrador\Documents\INGENIERIA_EN_SOFTWARE\TESIS\CODIGO\funcionalidades_validador_retratos\results\image_cache\0401407929.jpg"
-score = get_glasses_probability(path)                 # returns probability by default
-print(f"Probability of glasses: {score:.2%}")
+# path = r"C:\Users\Administrador\Documents\INGENIERIA_EN_SOFTWARE\TESIS\CODIGO\funcionalidades_validador_retratos\results\image_cache\0401407929.jpg"
+# score = get_glasses_probability(path)                 # returns probability by default
+# print(f"Probability of glasses: {score:.2%}")

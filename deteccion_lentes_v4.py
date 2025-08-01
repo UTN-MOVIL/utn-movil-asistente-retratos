@@ -1,85 +1,97 @@
+#!/usr/bin/env python3
+"""
+Detect glasses *and* highlight the exact image region defined by
+Face Mesh landmark indices [168, 6, 197, 195, 5, 4].
+
+Dependencies
+------------
+pip install opencv-python mediapipe numpy
+"""
+
+from typing import Optional, Tuple
+
 import cv2
 import mediapipe as mp
 import numpy as np
 
-def detect_glasses(image_path, face_mesh_detector):
-    """
-    Analyzes an image to detect if a person is wearing glasses.
 
-    Args:
-        image_path (str): The file path to the input image.
-        face_mesh_detector (mediapipe.solutions.face_mesh.FaceMesh):
-            An initialized MediaPipe FaceMesh object.
+# ──────────────────────────────────────────────────────────────────────────
+# Core routine
+# ──────────────────────────────────────────────────────────────────────────
+def detect_glasses(
+    image_path: str,
+    face_mesh_detector: "mp.solutions.face_mesh.FaceMesh",
+    *,
+    return_crop: bool = False,
+) -> Tuple[bool, Optional[np.ndarray]]:
+    """Detect glasses and optionally return / display the landmark ROI."""
+    image = cv2.imread(image_path)
+    if image is None:
+        raise FileNotFoundError(f"Could not read image: {image_path}")
+    h, w = image.shape[:2]
 
-    Returns:
-        bool: True if glasses are detected, False otherwise.
-              Returns False if no face is found or the image cannot be read.
-    """
-    # --- Image Loading ---
-    try:
-        image = cv2.imread(image_path)
-        if image is None:
-            print(f"Error: Could not read the image file: {image_path}")
-            return False
-    except Exception as e:
-        print(f"An error occurred while reading the file: {e}")
-        return False
+    # Face-mesh inference
+    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    results = face_mesh_detector.process(rgb)
 
-    # --- Core Processing ---
-    h, w, _ = image.shape
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    results = face_mesh_detector.process(image_rgb)
-
-    # --- Glasses Detection Logic ---
     glasses_present = False
+    crop: Optional[np.ndarray] = None
+
     if results.multi_face_landmarks:
-        face_landmarks = results.multi_face_landmarks[0]
-        
-        # 1. Convert landmarks to pixel coordinates
-        landmarks_px = [(int(landmark.x * w), int(landmark.y * h)) for landmark in face_landmarks.landmark]
+        lm = results.multi_face_landmarks[0].landmark
+        lm_px = np.array([(int(l.x * w), int(l.y * h)) for l in lm])
 
-        # 2. Define the nose bridge region of interest
-        nose_bridge_idxs = [168, 6, 197, 195, 5, 4]
-        nose_bridge_x = [landmarks_px[i][0] for i in nose_bridge_idxs]
-        
-        x_min, x_max = min(nose_bridge_x), max(nose_bridge_x)
-        y_min, y_max = landmarks_px[6][1], landmarks_px[4][1]
+        idxs = np.array([168, 6, 197, 195, 5, 4])
+        pts = lm_px[idxs]
 
-        # 3. Crop the nose bridge area
-        x_min, x_max = max(0, x_min - 5), min(w, x_max + 5)
-        y_min, y_max = max(0, y_min - 5), min(h, y_max + 5)
-        
-        cropped_nose = image[y_min:y_max, x_min:x_max]
-        
-        if cropped_nose.size > 0:
-            # 4. Use Canny edge detection on the cropped area
-            img_blur = cv2.GaussianBlur(cropped_nose, (3, 3), sigmaX=0, sigmaY=0)
-            edges = cv2.Canny(image=img_blur, threshold1=100, threshold2=200)
+        # Bounding box around the six landmarks
+        x, y, ww, hh = cv2.boundingRect(pts)
+        pad = 5
 
-            # 5. Check the central vertical line for edges (the glasses frame)
-            center_col_idx = edges.shape[1] // 2
-            if 255 in edges[:, center_col_idx]:
+        # ── NEW: keep only the top N % of the box ──────────────────────────────
+        FRACTION = 0.5                     # 0.5 → upper half, 0.3 → upper third …
+        x0 = max(0, x - pad)
+        y0 = max(0, y - pad)
+
+        # y1 is shifted downwards by FRACTION · hh instead of the full height
+        y1 = min(h, y + int(hh * FRACTION) + pad)
+        x1 = min(w, x + ww + pad)
+        # ───────────────────────────────────────────────────────────────────────
+
+        crop = image[y0:y1, x0:x1].copy()
+
+        # Simple edge-based heuristic for a glasses bridge
+        if crop.size:
+            edges = cv2.Canny(cv2.GaussianBlur(crop, (3, 3), 0), 100, 200)
+            if 255 in edges[:, edges.shape[1] // 2]:
                 glasses_present = True
-                
-    return glasses_present
 
-if __name__ == "__main__":
-    # Initialize MediaPipe Face Mesh once to improve performance
-    mp_face_mesh = mp.solutions.face_mesh
-    face_mesh = mp_face_mesh.FaceMesh(
-        static_image_mode=True,
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5
-    )
+        # ── DEBUG overlay: draw the ROI rectangle on the full image ─────────
+        cv2.rectangle(image, (x0, y0), (x1, y1), (0, 255, 0), 2)
+        cv2.imshow("Debug – ROI on full image", image)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()
+        # ────────────────────────────────────────────────────────────────────
 
-    # --- Set Image Path ---
-    # IMPORTANT: Replace this with the actual path to your image file
-    image_file_path = "tests/test_image.jpg"
+    return (glasses_present, crop) if return_crop else (glasses_present, None)
 
-    # --- Run Detection and Print Result ---
-    has_glasses = detect_glasses(image_path=image_file_path, face_mesh_detector=face_mesh)
-    print(has_glasses)
+# if __name__ == "__main__":
+#     with mp.solutions.face_mesh.FaceMesh(
+#         static_image_mode=True,
+#         max_num_faces=1,
+#         refine_landmarks=True,
+#         min_detection_confidence=0.5,
+#     ) as face_mesh:
 
-    # --- Cleanup ---
-    face_mesh.close()
+#         IMAGE_PATH = "C:\\Users\\Administrador\\Documents\\INGENIERIA_EN_SOFTWARE\\TESIS\\CODIGO\\funcionalidades_validador_retratos\\results\\image_cache\\0104651666.jpg"  # ← change to your file
+#         has_glasses, roi = detect_glasses(
+#             IMAGE_PATH,
+#             face_mesh,
+#             return_crop=True,
+#         )
+#         print("Glasses detected:", has_glasses)
+
+#         if roi is not None and roi.size:
+#             cv2.imshow("Cropped ROI", roi)
+#             cv2.waitKey(0)
+#             cv2.destroyAllWindows()

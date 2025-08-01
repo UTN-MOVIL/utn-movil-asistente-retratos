@@ -75,23 +75,23 @@ def detect_glasses(
 
     return (glasses_present, crop) if return_crop else (glasses_present, None)
 
-# if __name__ == "__main__":
-#     with mp.solutions.face_mesh.FaceMesh(
-#         static_image_mode=True,
-#         max_num_faces=1,
-#         refine_landmarks=True,
-#         min_detection_confidence=0.5,
-#     ) as face_mesh:
+if __name__ == "__main__":
+    with mp.solutions.face_mesh.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.5,
+    ) as face_mesh:
 
-#         IMAGE_PATH = "C:\\Users\\Administrador\\Documents\\INGENIERIA_EN_SOFTWARE\\TESIS\\CODIGO\\funcionalidades_validador_retratos\\results\\image_cache\\0104651666.jpg"  # ← change to your file
-#         has_glasses, roi = detect_glasses(
-#             IMAGE_PATH,
-#             face_mesh,
-#             return_crop=True,
-#         )
-#         print("Glasses detected:", has_glasses)
+        IMAGE_PATH = "tests/test_image.jpg"  # ← change to your file
+        has_glasses, roi = detect_glasses(
+            IMAGE_PATH,
+            face_mesh,
+            return_crop=True,
+        )
+        print("Glasses detected:", has_glasses)
 
-#         if roi is not None and roi.size:
-#             cv2.imshow("Cropped ROI", roi)
-#             cv2.waitKey(0)
-#             cv2.destroyAllWindows()
+        if roi is not None and roi.size:
+            cv2.imshow("Cropped ROI", roi)
+            cv2.waitKey(0)
+            cv2.destroyAllWindows()

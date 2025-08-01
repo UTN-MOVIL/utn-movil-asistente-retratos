@@ -76,5 +76,5 @@ def detect_glasses(
         return glasses_present, crop
     return glasses_present
 
-# has_glasses = detect_glasses("tests/test_image.jpg")
-# print(has_glasses)
+has_glasses = detect_glasses("tests/test_image.jpg")
+print(has_glasses)

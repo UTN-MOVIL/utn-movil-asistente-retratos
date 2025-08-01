@@ -64,23 +64,23 @@ def detect_glasses(image_path, face_mesh_detector):
     return glasses_present
 
 # --- Main Execution Block ---
-# if __name__ == "__main__":
-#     # Initialize MediaPipe Face Mesh once to improve performance
-#     mp_face_mesh = mp.solutions.face_mesh
-#     face_mesh = mp_face_mesh.FaceMesh(
-#         static_image_mode=True,
-#         max_num_faces=1,
-#         refine_landmarks=True,
-#         min_detection_confidence=0.5
-#     )
+if __name__ == "__main__":
+    # Initialize MediaPipe Face Mesh once to improve performance
+    mp_face_mesh = mp.solutions.face_mesh
+    face_mesh = mp_face_mesh.FaceMesh(
+        static_image_mode=True,
+        max_num_faces=1,
+        refine_landmarks=True,
+        min_detection_confidence=0.5
+    )
 
-#     # --- Set Image Path ---
-#     # IMPORTANT: Replace this with the actual path to your image file
-#     image_file_path = r"C:\Users\Administrador\Documents\INGENIERIA_EN_SOFTWARE\TESIS\datasets\validated_color\0401150834.jpg"
+    # --- Set Image Path ---
+    # IMPORTANT: Replace this with the actual path to your image file
+    image_file_path = "tests/test_image.jpg"
 
-#     # --- Run Detection and Print Result ---
-#     has_glasses = detect_glasses(image_path=image_file_path, face_mesh_detector=face_mesh)
-#     print(has_glasses)
+    # --- Run Detection and Print Result ---
+    has_glasses = detect_glasses(image_path=image_file_path, face_mesh_detector=face_mesh)
+    print(has_glasses)
 
-#     # --- Cleanup ---
-#     face_mesh.close()
+    # --- Cleanup ---
+    face_mesh.close()

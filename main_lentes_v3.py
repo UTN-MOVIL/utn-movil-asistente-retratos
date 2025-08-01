@@ -16,7 +16,7 @@ from preprocesamiento import (
 # --- MODIFICACIÓN: Importar el nuevo detector ---
 # Se asume que el archivo deteccion_lentes_v3.py contiene tu función
 # y todas sus dependencias necesarias (dlib, numpy, cv2, etc.)
-from deteccion_lentes_v3 import glasses_detect
+from deteccion_lentes_v3 import get_glasses_probability
 
 from exportacion_datos_excel import (
     format_to_hyperlinks,
@@ -97,14 +97,14 @@ def process_drive_folder_with_detector_v2(
 
     print(f"[INFO] ✅ Listas {len(image_paths)} imágenes para procesar.")
     
-    # --- MODIFICACIÓN: FASE 2: Detección con glasses_detector ---
+    # --- MODIFICACIÓN: FASE 2: Detección con get_glasses_probabilityor ---
     print("[INFO] 🔍 Iniciando detección de lentes...")
     detection_results: List[Any] = []
 
     for path in tqdm(image_paths, desc="Detectando lentes", unit="imagen"):
         try:
             # Intenta procesar la imagen como siempre
-            result = glasses_detect(path)
+            result = get_glasses_probability(path)
             detection_results.append(result)
 
         except Exception as e:
@@ -167,9 +167,13 @@ if __name__ == "__main__":
             
         # --- MODIFICACIÓN: Crear diccionario de resultados para el Excel ---
         def format_result(r):
-            if r == "present": return "SÍ"
-            if r == "absent": return "NO"
-            return str(r).replace('_', ' ').upper() # Formatea 'No face detected' y otros errores
+            # First, check if 'r' is a number (float or int)
+            if isinstance(r, (float, int)):
+                if r >= 0.5404: return "SÍ"
+                return "NO"  # No need for the second 'if', it's the only other case
+            
+            # If it's not a number, it must be a string. Handle it here.
+            return str(r).replace('_', ' ').upper()
 
         info = {
             "Rutas": format_to_hyperlinks(paths),

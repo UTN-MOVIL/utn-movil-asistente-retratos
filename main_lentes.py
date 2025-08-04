@@ -16,7 +16,7 @@ from preprocesamiento import (
 # --- MODIFICACIÓN: Importar el nuevo detector ---
 # Se asume que el archivo deteccion_lentes_v3.py contiene tu función
 # y todas sus dependencias necesarias (dlib, numpy, cv2, etc.)
-from deteccion_lentes_v1 import get_glasses_probability
+from deteccion_lentes import get_glasses_probability
 
 from exportacion_datos_excel import (
     format_to_hyperlinks,

@@ -114,7 +114,7 @@ def process_drive_folder_altura_menton(
     """
     print("[INFO] 🚀 Iniciando procesamiento (altura mentón → punto más alto)...")
 
-    drive = drive_service(force_reauth=True)
+    drive = drive_service(force_reauth=False)
     folder_id = get_folder_id_by_path(drive_folder_path, drive)
 
     print("[INFO] Obteniendo lista de archivos remotos de Google Drive...")

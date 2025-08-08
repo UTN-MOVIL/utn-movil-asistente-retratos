@@ -6,7 +6,7 @@ import concurrent.futures
 from typing import List, Tuple
 
 from tqdm import tqdm
-from PIL import Image
+from PIL import Image, ImageOps
 import cv2
 import numpy as np
 
@@ -239,14 +239,79 @@ def check_and_delete_corrupted_image(image_path: str) -> bool:
             print(f"[ERROR] No se pudo eliminar {image_path}: {e}")
         return True
 
+def ajustar_imagen_375x425(ruta: str, destino: str | None = None):
+    """
+    Redimensiona a 375x425 px solo si hace falta. También normaliza orientación EXIF.
+    Devuelve: (cambio_realizado: bool, ruta_salida: str, tamaño_final: (w,h))
+    """
+    with Image.open(ruta) as im:
+        orig_format = im.format
+        exif_obj = None
+        try:
+            exif_obj = im.getexif()
+        except Exception:
+            exif_obj = None
+        orientation = exif_obj.get(274, 1) if exif_obj else 1  # 274 = Orientation
+
+        im2 = ImageOps.exif_transpose(im)  # aplica orientación si es necesario
+
+        changed = False
+        if im2.size != (375, 425):
+            im2 = im2.resize((375, 425), Image.Resampling.LANCZOS)
+            changed = True
+
+        # Si solo cambió la orientación (sin resize), también guardamos
+        if not changed and orientation != 1:
+            changed = True
+
+        out = destino or ruta
+        if changed or (destino and destino != ruta):
+            if exif_obj:
+                exif_obj[274] = 1  # deja la orientación “normalizada”
+                exif_bytes = exif_obj.tobytes()
+            else:
+                exif_bytes = None
+
+            save_kwargs = {}
+            if exif_bytes:
+                save_kwargs["exif"] = exif_bytes
+            # Mantén el mismo formato si sobrescribes el mismo archivo
+            if destino is None and orig_format:
+                save_kwargs["format"] = orig_format
+
+            im2.save(out, **save_kwargs)
+
+        return changed, out, im2.size
+
 def process_image_list(image_paths: List[str]) -> int:
     deleted_count = 0
+    resized_count = 0
+    skipped_count = 0
+    errors = 0
+
     total_images = len(image_paths)
     print(f"🚀 Analizando {total_images} imágenes...")
 
     for path in image_paths:
-        if check_and_delete_corrupted_image(path):
-            deleted_count += 1
+        try:
+            # Si se eliminó por corrupción, no continúes con ajustes
+            if check_and_delete_corrupted_image(path):
+                deleted_count += 1
+                continue
 
-    print(f"\n✨ Listo: Revisadas {total_images} | Eliminadas {deleted_count}")
+            changed, _, _ = ajustar_imagen_375x425(path)
+            if changed:
+                resized_count += 1
+            else:
+                skipped_count += 1
+
+        except FileNotFoundError:
+            # El archivo pudo ser eliminado por otro proceso
+            deleted_count += 1
+        except Exception as e:
+            errors += 1
+            print(f"⚠️  Error procesando '{path}': {e}")
+
+    print(f"\n✨ Listo: Revisadas {total_images} | Redimensionadas/ajustadas {resized_count} | "
+          f"Saltadas {skipped_count} | Eliminadas {deleted_count} | Errores {errors}")
     return deleted_count

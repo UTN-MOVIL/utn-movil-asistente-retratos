@@ -3,7 +3,6 @@
 
 import os
 import sys
-import math
 from typing import List, Tuple, Any, Union
 from tqdm import tqdm
 
@@ -11,12 +10,9 @@ import cv2
 import mediapipe as mp
 import numpy as np
 
+# 🔁 Solo importamos lo que sí usaremos (validación local de imágenes)
 from modulos.preprocesamiento import (
-    drive_service,
-    get_folder_id_by_path,
-    list_files_recursive,
-    download_files_parallel,
-    process_image_list,
+    process_image_list,   # ← mantiene tu validación/borrado de corruptos si quieres
 )
 
 from modulos.exportacion_datos_excel import (
@@ -26,48 +22,39 @@ from modulos.exportacion_datos_excel import (
     get_file_count,
 )
 
-# Si quieres “reutilizar” explícitamente el módulo, puedes importarlo así;
-# no es obligatorio para que funcione, pero lo dejo por claridad.
-# from modulos import puntos_faciales as pf
-
-CACHE_DIR = "image_cache"
+CACHE_DIR = "image_cache"   # ya no se usa para descargar, pero lo dejamos por compatibilidad
 
 # ----------------------- Cálculo con MediaPipe -----------------------
 
-# Índice de mentón (MediaPipe Face Mesh)
-CHIN_IDX = 152
+CHIN_IDX = 152  # Índice de mentón (MediaPipe Face Mesh)
 
 def _chin_to_top_distance_px_from_landmarks(face_landmarks, w: int, h: int) -> float:
     """
-    Devuelve la distancia euclidiana en píxeles entre el mentón (LM 152)
-    y el punto más alto visible de la cara (mínimo y en los landmarks).
+    Devuelve la distancia VERTICAL (px) entre el mentón (LM 152)
+    y el punto más alto visible de la cara (mínimo y entre los landmarks).
     """
     lms = face_landmarks.landmark
 
     # Mentón
     chin = lms[CHIN_IDX]
-    x_chin = chin.x * w
     y_chin = chin.y * h
 
     # Punto más alto: el landmark con y normalizada más pequeña
     top_idx = min(range(len(lms)), key=lambda i: lms[i].y)
-    top_lm = lms[top_idx]
-    x_top = top_lm.x * w
-    y_top = top_lm.y * h
+    y_top = lms[top_idx].y * h
 
-    # Distancia euclidiana en px
+    # Distancia vertical en píxeles
     dist_px = abs(y_chin - y_top)
     return float(dist_px)
 
 
 def medir_altura_menton_en_imagenes(image_paths: List[str]) -> List[Union[float, str]]:
     """
-    Procesa una lista de paths a imágenes y devuelve, para cada una,
-    la distancia (px) del mentón al punto más alto. Si no hay rostro, retorna 'No face detected'.
+    Procesa una lista de paths a imágenes locales y devuelve, para cada una,
+    la distancia (px) del mentón al punto más alto. Si no hay rostro, 'No face detected'.
     """
     results: List[Union[float, str]] = []
 
-    # Reutilizamos UNA sola instancia de FaceMesh para todas las imágenes
     mp_face_mesh = mp.solutions.face_mesh
     with mp_face_mesh.FaceMesh(
         static_image_mode=True,      # ideal para imágenes sueltas
@@ -95,91 +82,59 @@ def medir_altura_menton_en_imagenes(image_paths: List[str]) -> List[Union[float,
                 dist_px = _chin_to_top_distance_px_from_landmarks(face_lms, w, h)
                 results.append(round(dist_px, 2))
             except Exception as e:
-                # Si algo explota con esta imagen, marcamos el error
                 results.append(f"Error: {e}")
 
     return results
 
 
-# ----------------------- Pipeline Drive + Excel -----------------------
+# ----------------------- Util: listar imágenes locales -----------------------
 
-def process_drive_folder_altura_menton(
-    drive_folder_path: str,
-    max_workers: int = 4,
-    forzar_descarga: bool = False,
-) -> Tuple[List[str], List[Any]]:
+def listar_imagenes_locales(root_dir: str,
+                            extensiones: tuple = (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp")
+                           ) -> List[str]:
     """
-    Descarga/usa caché de imágenes de Drive, mide la distancia mentón→tope,
-    y retorna (paths_locales, distancias_o_mensajes).
+    Recorre recursivamente root_dir y retorna la lista de imágenes encontradas.
     """
-    print("[INFO] 🚀 Iniciando procesamiento (altura mentón → punto más alto)...")
+    if not os.path.isdir(root_dir):
+        raise FileNotFoundError(f"La ruta no existe o no es carpeta: {root_dir}")
 
-    drive = drive_service(force_reauth=False)
-    folder_id = get_folder_id_by_path(drive_folder_path, drive)
-
-    print("[INFO] Obteniendo lista de archivos remotos de Google Drive...")
-    remote_files = list_files_recursive(folder_id, drive)
-    if not remote_files:
-        print("[ERROR] No se encontraron archivos en la carpeta de Drive.")
-        return [], []
-    print(f"[INFO] Encontrados {len(remote_files)} archivos en Drive.")
-
-    # --- LÓGICA DE CACHÉ ---
-    os.makedirs(CACHE_DIR, exist_ok=True)
-    valid_ext = {".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp"}
-
-    remote_image_files = [
-        (fid, name)
-        for fid, name in remote_files
-        if any(name.lower().endswith(ext) for ext in valid_ext)
-    ]
-
-    if forzar_descarga:
-        print("[INFO] ⚠️ Forzando nueva descarga. Limpiando caché local...")
-        for f in os.listdir(CACHE_DIR):
-            try:
-                os.remove(os.path.join(CACHE_DIR, f))
-            except OSError as e:
-                print(f"[WARNING] No se pudo eliminar {f} del caché: {e}")
-
-    files_to_download = []
-    cached_image_paths = []
-    print("[INFO] 🔎 Verificando caché local...")
-    for file_id, file_name in remote_image_files:
-        local_path = os.path.join(CACHE_DIR, file_name)
-        if os.path.exists(local_path) and not forzar_descarga:
-            cached_image_paths.append(local_path)
-        else:
-            files_to_download.append((file_id, file_name))
-
-    if cached_image_paths:
-        print(f"[INFO] ✅ {len(cached_image_paths)} archivos encontrados en el caché.")
-
-    if files_to_download:
-        print(f"[INFO] 📥 Se descargarán {len(files_to_download)} archivos nuevos o faltantes.")
-        downloaded_paths = download_files_parallel(
-            files_to_download, CACHE_DIR, drive_service, max_workers
-        )
-        image_paths = cached_image_paths + downloaded_paths
-    else:
-        print("[INFO] ✅ El caché local ya está completo. No se necesitan descargas.")
-        image_paths = cached_image_paths
+    image_paths: List[str] = []
+    for base, _, files in os.walk(root_dir):
+        for fn in files:
+            if fn.lower().endswith(extensiones):
+                image_paths.append(os.path.join(base, fn))
 
     image_paths.sort()
+    return image_paths
 
+
+# ----------------------- Pipeline LOCAL + Excel -----------------------
+
+def process_local_folder_altura_menton(
+    local_folder_path: str,
+    forzar_descarga: bool = False,   # se ignora; lo mantenemos para compatibilidad de firma
+) -> Tuple[List[str], List[Any]]:
+    """
+    Lee imágenes desde una carpeta LOCAL (ya montada en Colab), mide la distancia mentón→tope
+    y retorna (paths_locales, distancias_o_mensajes).
+    """
+    print("[INFO] 🚀 Iniciando procesamiento LOCAL (altura mentón → punto más alto)...")
+
+    # 1) Listar imágenes locales (sin API de Drive, sin descargas)
+    image_paths = listar_imagenes_locales(local_folder_path)
     if not image_paths:
-        print("[WARNING] No hay imágenes válidas para procesar.")
+        print("[ERROR] No se encontraron imágenes en la carpeta local.")
         return [], []
+    print(f"[INFO] Encontradas {len(image_paths)} imágenes en la carpeta local.")
 
-    # (Opcional) cualquier preprocesado que ya tengas
+    # 2) (Opcional) Validación/borrado de archivos corruptos usando tu helper existente
     process_image_list(image_paths)
 
+    # 3) Medición principal
     print(f"[INFO] ✅ Listas {len(image_paths)} imágenes para medir distancia mentón→tope.")
-
-    # --- Medición principal ---
     distances = medir_altura_menton_en_imagenes(image_paths)
 
-    # Pequeñas estadísticas
+    # 4) Pequeñas estadísticas
     nums = [d for d in distances if isinstance(d, (int, float))]
     no_face = sum(1 for d in distances if isinstance(d, str) and "No face" in d)
     errores = len(distances) - len(nums) - no_face
@@ -199,22 +154,19 @@ def process_drive_folder_altura_menton(
 # ----------------------- Main -----------------------
 
 if __name__ == "__main__":
-    # --- CONFIGURACIÓN ---
-    dataset_drive_path = (
-        "/Mi unidad/INGENIERIA_EN_SOFTWARE/5to_Semestre/"
+    # --- CONFIGURACIÓN: carpeta LOCAL ya montada en Colab ---
+    dataset_local_path = (
+        "/content/drive/MyDrive/INGENIERIA_EN_SOFTWARE/5to_Semestre/"
         "PRACTICAS/Primera_Revision/"
         "validator/results/sin_procesar"
     )
-    MAX_THREADS = 6
-
     os.makedirs("results", exist_ok=True)
 
     try:
-        # Ejecutar pipeline de medición
-        paths, distances = process_drive_folder_altura_menton(
-            dataset_drive_path,
-            max_workers=MAX_THREADS,
-            forzar_descarga=False,   # pon True si quieres limpiar el caché
+        # Ejecutar pipeline LOCAL (sin descargas por API)
+        paths, distances = process_local_folder_altura_menton(
+            dataset_local_path,
+            forzar_descarga=False,   # no aplica; se deja para compatibilidad
         )
 
         if not paths:

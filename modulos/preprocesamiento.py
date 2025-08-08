@@ -65,29 +65,56 @@ def _load_image_optimized(ruta_imagen: str) -> np.ndarray:
 
 # ─────────────────────── Google Drive helpers ────────────────────────────────
 def drive_service(force_reauth: bool = False):
-    creds = None
+    # Detecta Colab
+    try:
+        from google.colab import auth as colab_auth
+        IN_COLAB = True
+    except Exception:
+        IN_COLAB = False
 
-    # 1) Carga token si existe y no forzamos reauth
+    if IN_COLAB:
+        # 1) Popup de login en Colab
+        from google.colab import auth as colab_auth
+        colab_auth.authenticate_user()
+
+        # 2) Toma las credenciales por defecto del runtime de Colab
+        import google.auth
+        creds, _ = google.auth.default(scopes=SCOPES)
+
+        return build("drive", "v3", credentials=creds)
+
+    # --- Fuera de Colab: usa el flujo de app instalada ---
+    from google.oauth2.credentials import Credentials
+    from google_auth_oauthlib.flow import InstalledAppFlow
+    from google.auth.transport.requests import Request
+    from google.auth.exceptions import RefreshError
+    import webbrowser
+
+    TOKEN_FILE = "token.json"
+    CREDS_FILE = "credentials.json"
+
+    creds = None
     if os.path.exists(TOKEN_FILE) and not force_reauth:
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
 
-    # 2) Si no es válido, intenta refrescarlo; si falla, reautentica
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
             try:
                 creds.refresh(Request())
-            except RefreshError as e:
-                print(f"[AUTH] RefreshError: {e}. Eliminando {TOKEN_FILE} y reautenticando…")
-                try:
-                    os.remove(TOKEN_FILE)
-                except OSError:
-                    pass
+            except RefreshError:
+                try: os.remove(TOKEN_FILE)
+                except OSError: pass
                 creds = None
 
         if not creds:
             flow = InstalledAppFlow.from_client_secrets_file(CREDS_FILE, SCOPES)
-            # Garantiza refresh token nuevo
-            creds = flow.run_local_server(port=0, access_type='offline', prompt='consent')
+            try:
+                # Intenta abrir navegador local (solo si hay GUI)
+                creds = flow.run_local_server(port=0, access_type="offline", prompt="consent")
+            except Exception as e:
+                print(f"[AUTH] run_local_server falló ({e}). Usando flujo por consola…")
+                # Fallback headless: copia/pega el código de verificación
+                creds = flow.run_console()  # <- puede pedirte pegar un código
 
         with open(TOKEN_FILE, "w") as f:
             f.write(creds.to_json())

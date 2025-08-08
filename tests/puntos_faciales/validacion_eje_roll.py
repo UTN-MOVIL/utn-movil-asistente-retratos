@@ -1,5 +1,11 @@
 # medir_inclinacion_iris.py
 import cv2
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[2]   # .../funcionalidades_validador_retratos
+sys.path.insert(0, str(ROOT))                # añade la raíz al PYTHONPATH
+
 from modulos.puntos_faciales import AppConfig, FaceMeshApp, DrawOptions
 
 # Índices de iris (MediaPipe) – necesitan refine_landmarks=True

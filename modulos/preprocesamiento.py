@@ -62,20 +62,35 @@ def _load_image_optimized(ruta_imagen: str) -> np.ndarray:
     return _image_cache[img_hash]
 
 # ─────────────────────── Google Drive helpers ────────────────────────────────
-def drive_service():
-    """Devuelve una instancia del cliente de Drive.
+def drive_service(force_reauth: bool = False):
+    creds = None
 
-    ⚡ OPT-1: cache_discovery=False evita descargar el documento de descubrimiento
-    en cada hilo, ahorrando ~300 KB y un round-trip por hilo. """
-    if os.path.exists(TOKEN_FILE):
+    # 1) Carga token si existe y no forzamos reauth
+    if os.path.exists(TOKEN_FILE) and not force_reauth:
         creds = Credentials.from_authorized_user_file(TOKEN_FILE, SCOPES)
-    else:
-        flow  = InstalledAppFlow.from_client_secrets_file(CREDS_FILE, SCOPES)
-        creds = flow.run_local_server(port=0)
+
+    # 2) Si no es válido, intenta refrescarlo; si falla, reautentica
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+            except RefreshError as e:
+                print(f"[AUTH] RefreshError: {e}. Eliminando {TOKEN_FILE} y reautenticando…")
+                try:
+                    os.remove(TOKEN_FILE)
+                except OSError:
+                    pass
+                creds = None
+
+        if not creds:
+            flow = InstalledAppFlow.from_client_secrets_file(CREDS_FILE, SCOPES)
+            # Garantiza refresh token nuevo
+            creds = flow.run_local_server(port=0, access_type='offline', prompt='consent')
+
         with open(TOKEN_FILE, "w") as f:
             f.write(creds.to_json())
 
-    return build("drive", "v3", credentials=creds, cache_discovery=False)  # OPT-1 ✔
+    return build("drive", "v3", credentials=creds)
 
 def get_folder_id_by_path(path: str, drive):
     segments  = [s for s in path.strip("/").split("/") if s and s != "Mi unidad"]

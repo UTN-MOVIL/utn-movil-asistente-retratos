@@ -1,4 +1,4 @@
-# puntos_faciales.py
+# modulos/puntos_faciales.py
 import time
 from dataclasses import dataclass, field
 from typing import Callable, Optional, Any
@@ -6,6 +6,9 @@ from typing import Callable, Optional, Any
 import cv2
 import mediapipe as mp
 import numpy as np
+
+# Alias global reutilizable del módulo de FaceMesh
+FM = mp.solutions.face_mesh
 
 
 # ───────────────────────── Configuración ─────────────────────────
@@ -37,14 +40,13 @@ class Drawer:
     def __init__(self) -> None:
         self._mp_drawing = mp.solutions.drawing_utils
         self._mp_styles = mp.solutions.drawing_styles
-        self._mp_face_mesh = mp.solutions.face_mesh
 
     def draw_face(self, image: np.ndarray, face_landmarks: Any, opts: DrawOptions) -> None:
         if opts.tesselation:
             self._mp_drawing.draw_landmarks(
                 image=image,
                 landmark_list=face_landmarks,
-                connections=self._mp_face_mesh.FACEMESH_TESSELATION,
+                connections=FM.FACEMESH_TESSELATION,
                 landmark_drawing_spec=None,
                 connection_drawing_spec=self._mp_styles.get_default_face_mesh_tesselation_style(),
             )
@@ -53,7 +55,7 @@ class Drawer:
             self._mp_drawing.draw_landmarks(
                 image=image,
                 landmark_list=face_landmarks,
-                connections=self._mp_face_mesh.FACEMESH_CONTOURS,
+                connections=FM.FACEMESH_CONTOURS,
                 landmark_drawing_spec=None,
                 connection_drawing_spec=self._mp_styles.get_default_face_mesh_contours_style(),
             )
@@ -62,7 +64,7 @@ class Drawer:
             self._mp_drawing.draw_landmarks(
                 image=image,
                 landmark_list=face_landmarks,
-                connections=self._mp_face_mesh.FACEMESH_IRISES,
+                connections=FM.FACEMESH_IRISES,
                 landmark_drawing_spec=None,
                 connection_drawing_spec=self._mp_styles.get_default_face_mesh_iris_connections_style(),
             )
@@ -83,7 +85,6 @@ class FaceMeshApp:
         self.drawer = Drawer()
         self.on_after_draw = on_after_draw
 
-        self._mp_face_mesh = mp.solutions.face_mesh
         self._cap: Optional[cv2.VideoCapture] = None
         self._writer: Optional[cv2.VideoWriter] = None
         self._last_t = time.time()
@@ -122,7 +123,7 @@ class FaceMeshApp:
     def run(self) -> None:
         self._init_capture()
 
-        with self._mp_face_mesh.FaceMesh(
+        with FM.FaceMesh(
             max_num_faces=self.cfg.max_faces,
             refine_landmarks=self.cfg.refine_landmarks,
             min_detection_confidence=self.cfg.min_det_conf,
@@ -161,7 +162,8 @@ class FaceMeshApp:
                 cv2.imshow(self.cfg.window_name, out)
 
                 if self._writer:
-                    self._writer.write(frame)
+                    # Escribe lo mismo que ves (respeta flip si aplica)
+                    self._writer.write(out)
 
                 key = cv2.waitKey(5) & 0xFF
                 if key == ord("q") or cv2.getWindowProperty(self.cfg.window_name, cv2.WND_PROP_VISIBLE) < 1:
@@ -178,7 +180,85 @@ class FaceMeshApp:
         cv2.destroyAllWindows()
 
 
-# ───────────────────────── Ejemplos de uso ─────────────────────────
+# ───────────────────────── Funciones de medición reutilizables ─────────────────────────
+def chin_to_top_distance_px_from_landmarks(face_landmarks, w: int, h: int) -> float:
+    """
+    Distancia VERTICAL (px) entre el mentón (LM 152) y el punto más alto visible
+    (mínimo y entre landmarks). Usa coordenadas ya normalizadas multiplicadas por w/h.
+    """
+    CHIN_IDX = 152
+    lms = face_landmarks.landmark
+    y_chin = lms[CHIN_IDX].y * h
+    top_idx = min(range(len(lms)), key=lambda i: lms[i].y)
+    y_top = lms[top_idx].y * h
+    return float(abs(y_chin - y_top))
+
+
+def porcentaje_rostro_desde_landmarks(
+    face_landmarks,
+    w: int,
+    h: int,
+    usar_convhull: bool = False
+) -> float:
+    """
+    Calcula el % de rostro (área rostro / área imagen * 100) directamente desde landmarks.
+    - usar_convhull=False -> usa bounding box de los landmarks (más estable/rápido).
+    - usar_convhull=True  -> usa el convex hull de los landmarks (más fiel al contorno).
+    """
+    lms = face_landmarks.landmark
+    xs = np.array([lm.x * w for lm in lms], dtype=np.float32)
+    ys = np.array([lm.y * h for lm in lms], dtype=np.float32)
+
+    if usar_convhull:
+        pts = np.stack([xs, ys], axis=1).astype(np.float32).reshape(-1, 1, 2)
+        hull = cv2.convexHull(pts)
+        area_rostro = float(cv2.contourArea(hull))
+    else:
+        x_min = max(0, int(np.floor(xs.min())))
+        x_max = min(w - 1, int(np.ceil(xs.max())))
+        y_min = max(0, int(np.floor(ys.min())))
+        y_max = min(h - 1, int(np.ceil(ys.max())))
+        area_rostro = float(max(0, x_max - x_min) * max(0, y_max - y_min))
+
+    area_total = float(w * h)
+    return (area_rostro / area_total) * 100.0 if area_total > 0 else 0.0
+
+
+def FUN_CALCULAR_PORCENTAJE_ROSTRO(
+    pImagen: np.ndarray,
+    C_intAreaFoto: int | None = None,
+    usar_convhull: bool = False,
+    min_detection_confidence: float = 0.5
+) -> float:
+    """
+    Alternativa de una sola imagen: procesa FaceMesh internamente.
+    Devuelve % de rostro respecto al área de la imagen.
+    """
+    if pImagen is None or pImagen.size == 0:
+        raise ValueError("pImagen está vacía o es None.")
+
+    h, w = pImagen.shape[:2]
+    area_total = C_intAreaFoto if C_intAreaFoto is not None else (w * h)
+    if area_total <= 0:
+        raise ValueError("El área total de la foto debe ser > 0.")
+
+    imagen_rgb = cv2.cvtColor(pImagen, cv2.COLOR_BGR2RGB)
+
+    with FM.FaceMesh(
+        static_image_mode=True,
+        refine_landmarks=False,
+        max_num_faces=1,
+        min_detection_confidence=min_detection_confidence
+    ) as face_mesh:
+        results = face_mesh.process(imagen_rgb)
+
+    if not results.multi_face_landmarks:
+        return 0.0
+
+    return porcentaje_rostro_desde_landmarks(results.multi_face_landmarks[0], w, h, usar_convhull)
+
+
+# ───────────────────────── Ejemplo de overlay ─────────────────────────
 def ejemplo_overlay(frame: np.ndarray, results: Any) -> None:
     """
     Ejemplo de callback: muestra cuántas caras detectadas en la esquina.
@@ -198,10 +278,8 @@ if __name__ == "__main__":
         min_det_conf=0.5,
         min_track_conf=0.5,
         flip_display=True,
-        # Para usar un archivo en lugar de webcam, descomenta:
-        # input_path="ruta/a/tu/video.mp4"  # o a una imagen; en imagen terminará tras 1 frame
-        # Para grabar salida:
-        # write_video="salida.mp4", out_fps=30, fourcc="mp4v"
+        # input_path="ruta/a/tu/video_o_imagen",
+        # write_video="salida.mp4", out_fps=30, fourcc="mp4v",
     )
 
     app = FaceMeshApp(cfg, on_after_draw=ejemplo_overlay)

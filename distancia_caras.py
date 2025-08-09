@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+# distancia_caras.py
+
 import os
 import sys
 from typing import List, Tuple, Any, Union
 from tqdm import tqdm
 
 import cv2
-import mediapipe as mp
 import numpy as np
 
 # 🔁 Solo importamos lo que sí usaremos (validación local de imágenes)
@@ -22,52 +23,46 @@ from modulos.exportacion_datos_excel import (
     get_file_count,
 )
 
+# Reutiliza el alias FM y las funciones del módulo común
+from modulos.puntos_faciales import (
+    FM,
+    chin_to_top_distance_px_from_landmarks as chin_dist,
+    porcentaje_rostro_desde_landmarks as pct_from_lms,
+)
+
 CACHE_DIR = "image_cache"   # ya no se usa para descargar, pero lo dejamos por compatibilidad
 
-# ----------------------- Cálculo con MediaPipe -----------------------
 
-CHIN_IDX = 152  # Índice de mentón (MediaPipe Face Mesh)
-
-def _chin_to_top_distance_px_from_landmarks(face_landmarks, w: int, h: int) -> float:
+# ----------------------- Cálculo por imagen (1 pasada) -----------------------
+def medir_altura_y_porcentaje_en_imagenes(
+    image_paths: List[str],
+    usar_convhull: bool = False
+) -> Tuple[List[Union[float, str]], List[Union[float, str]]]:
     """
-    Devuelve la distancia VERTICAL (px) entre el mentón (LM 152)
-    y el punto más alto visible de la cara (mínimo y entre los landmarks).
+    Devuelve dos listas paralelas:
+      - distancias_px: distancia mentón→punto más alto (px)
+      - porcentajes:   % de rostro respecto al área de la imagen
+    Si falla o no hay rostro, retorna el mismo mensaje en ambas listas.
+
+    Hace UNA sola inferencia FaceMesh por imagen y reutiliza los mismos landmarks.
     """
-    lms = face_landmarks.landmark
+    distancias: List[Union[float, str]] = []
+    porcentajes: List[Union[float, str]] = []
 
-    # Mentón
-    chin = lms[CHIN_IDX]
-    y_chin = chin.y * h
-
-    # Punto más alto: el landmark con y normalizada más pequeña
-    top_idx = min(range(len(lms)), key=lambda i: lms[i].y)
-    y_top = lms[top_idx].y * h
-
-    # Distancia vertical en píxeles
-    dist_px = abs(y_chin - y_top)
-    return float(dist_px)
-
-
-def medir_altura_menton_en_imagenes(image_paths: List[str]) -> List[Union[float, str]]:
-    """
-    Procesa una lista de paths a imágenes locales y devuelve, para cada una,
-    la distancia (px) del mentón al punto más alto. Si no hay rostro, 'No face detected'.
-    """
-    results: List[Union[float, str]] = []
-
-    mp_face_mesh = mp.solutions.face_mesh
-    with mp_face_mesh.FaceMesh(
+    with FM.FaceMesh(
         static_image_mode=True,      # ideal para imágenes sueltas
         max_num_faces=1,
         refine_landmarks=True,
         min_detection_confidence=0.5,
         min_tracking_confidence=0.5,
     ) as face_mesh:
-        for path in tqdm(image_paths, desc="Midiendo (mentón→tope)", unit="imagen"):
+        for path in tqdm(image_paths, desc="Midiendo (mentón→tope y % rostro)", unit="imagen"):
             try:
                 img = cv2.imread(path)
                 if img is None:
-                    results.append("Archivo no legible")
+                    msg = "Archivo no legible"
+                    distancias.append(msg)
+                    porcentajes.append(msg)
                     continue
 
                 h, w = img.shape[:2]
@@ -75,20 +70,29 @@ def medir_altura_menton_en_imagenes(image_paths: List[str]) -> List[Union[float,
                 out = face_mesh.process(rgb)
 
                 if not out.multi_face_landmarks:
-                    results.append("No face detected")
+                    msg = "No face detected"
+                    distancias.append(msg)
+                    porcentajes.append(msg)
                     continue
 
                 face_lms = out.multi_face_landmarks[0]
-                dist_px = _chin_to_top_distance_px_from_landmarks(face_lms, w, h)
-                results.append(round(dist_px, 2))
-            except Exception as e:
-                results.append(f"Error: {e}")
 
-    return results
+                # Distancia (reutiliza tu función del módulo):
+                dist_px = chin_dist(face_lms, w, h)
+                # Porcentaje (desde los mismos landmarks):
+                pct = pct_from_lms(face_lms, w, h, usar_convhull=usar_convhull)
+
+                distancias.append(round(float(dist_px), 2))
+                porcentajes.append(round(float(pct), 2))
+            except Exception as e:
+                msg = f"Error: {e}"
+                distancias.append(msg)
+                porcentajes.append(msg)
+
+    return distancias, porcentajes
 
 
 # ----------------------- Util: listar imágenes locales -----------------------
-
 def listar_imagenes_locales(root_dir: str,
                             extensiones: tuple = (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".webp")
                            ) -> List[str]:
@@ -109,50 +113,55 @@ def listar_imagenes_locales(root_dir: str,
 
 
 # ----------------------- Pipeline LOCAL + Excel -----------------------
-
 def process_local_folder_altura_menton(
     local_folder_path: str,
     forzar_descarga: bool = False,   # se ignora; lo mantenemos para compatibilidad de firma
-) -> Tuple[List[str], List[Any]]:
+    usar_convhull: bool = False      # <- controla el % de rostro
+) -> Tuple[List[str], List[Any], List[Any]]:
     """
-    Lee imágenes desde una carpeta LOCAL (ya montada en Colab), mide la distancia mentón→tope
-    y retorna (paths_locales, distancias_o_mensajes).
+    Lee imágenes desde una carpeta LOCAL, mide la distancia mentón→tope y el % de rostro.
+    Retorna (paths_locales, distancias_o_mensajes, porcentajes_o_mensajes).
     """
-    print("[INFO] 🚀 Iniciando procesamiento LOCAL (altura mentón → punto más alto)...")
+    print("[INFO] 🚀 Iniciando procesamiento LOCAL (altura mentón → punto más alto + % rostro)...")
 
     # 1) Listar imágenes locales (sin API de Drive, sin descargas)
     image_paths = listar_imagenes_locales(local_folder_path)
     if not image_paths:
         print("[ERROR] No se encontraron imágenes en la carpeta local.")
-        return [], []
+        return [], [], []
     print(f"[INFO] Encontradas {len(image_paths)} imágenes en la carpeta local.")
 
     # 2) (Opcional) Validación/borrado de archivos corruptos usando tu helper existente
     process_image_list(image_paths)
 
-    # 3) Medición principal
-    print(f"[INFO] ✅ Listas {len(image_paths)} imágenes para medir distancia mentón→tope.")
-    distances = medir_altura_menton_en_imagenes(image_paths)
+    # 3) Medición principal (1 sola pasada)
+    print(f"[INFO] ✅ Listas {len(image_paths)} imágenes para medir distancia y % rostro.")
+    distances, percents = medir_altura_y_porcentaje_en_imagenes(
+        image_paths,
+        usar_convhull=usar_convhull
+    )
 
     # 4) Pequeñas estadísticas
-    nums = [d for d in distances if isinstance(d, (int, float))]
-    no_face = sum(1 for d in distances if isinstance(d, str) and "No face" in d)
-    errores = len(distances) - len(nums) - no_face
+    nums_dist = [d for d in distances if isinstance(d, (int, float, np.floating))]
+    nums_pct  = [p for p in percents  if isinstance(p, (int, float, np.floating))]
+    no_face   = sum(1 for d in distances if isinstance(d, str) and "No face" in d)
+    errores   = len(distances) - len(nums_dist) - no_face
     if distances:
         print("\n[INFO] 📈 Estadísticas:")
-        print(f" • Medidas válidas: {len(nums)}")
-        print(f" • Sin rostro:      {no_face}")
-        print(f" • Errores:         {errores}")
-        if nums:
-            arr = np.array(nums, dtype=float)
-            print(f" • Promedio (px):   {arr.mean():.2f}")
-            print(f" • Mín/Máx (px):    {arr.min():.2f} / {arr.max():.2f}")
+        print(f" • Medidas válidas:       {len(nums_dist)}")
+        print(f" • Sin rostro:            {no_face}")
+        print(f" • Errores:               {errores}")
+        if nums_dist:
+            arr = np.array(nums_dist, dtype=float)
+            print(f" • Distancia px (prom):   {arr.mean():.2f}  min/max: {arr.min():.2f}/{arr.max():.2f}")
+        if nums_pct:
+            arr = np.array(nums_pct, dtype=float)
+            print(f" • % rostro (prom):       {arr.mean():.2f}  min/max: {arr.min():.2f}/{arr.max():.2f}")
 
-    return image_paths, distances
+    return image_paths, distances, percents
 
 
 # ----------------------- Main -----------------------
-
 if __name__ == "__main__":
     # --- CONFIGURACIÓN: carpeta LOCAL ya montada en Colab ---
     dataset_local_path = (
@@ -164,18 +173,23 @@ if __name__ == "__main__":
 
     try:
         # Ejecutar pipeline LOCAL (sin descargas por API)
-        paths, distances = process_local_folder_altura_menton(
+        paths, distances, percents = process_local_folder_altura_menton(
             dataset_local_path,
             forzar_descarga=False,   # no aplica; se deja para compatibilidad
+            usar_convhull=False      # cámbialo a True si prefieres convex hull
         )
 
         if not paths:
             sys.exit(1)
 
-        # ---- Excel: 2 columnas (Ruta, Distancia_px) ----
+        # ---- Excel: 3 columnas (Ruta, Distancia_px, %_rostro) ----
+        def _round_or_msg(x):
+            return round(float(x), 2) if isinstance(x, (int, float, np.floating)) else x
+
         info = {
             "Ruta": format_to_hyperlinks(paths),
-            "Distancia_menton_a_punto_mas_alto_px": distances,
+            "Distancia_menton_a_punto_mas_alto_px": [ _round_or_msg(d) for d in distances ],
+            "Porcentaje_rostro": [ _round_or_msg(p) for p in percents ],
         }
         normalized = normalize_dict_lengths(info)
 

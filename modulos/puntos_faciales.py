@@ -257,6 +257,8 @@ def FUN_CALCULAR_PORCENTAJE_ROSTRO(
 
     return porcentaje_rostro_desde_landmarks(results.multi_face_landmarks[0], w, h, usar_convhull)
 
+def FUN_PORCENTAJE_ROSTRO_VALIDO(porcentaje):
+    return porcentaje <= 26.28
 
 # ───────────────────────── Ejemplo de overlay ─────────────────────────
 def ejemplo_overlay(frame: np.ndarray, results: Any) -> None:

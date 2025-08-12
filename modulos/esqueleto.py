@@ -1,211 +1,418 @@
 # modulos/esqueleto.py
-import cv2
-import time
+
+from __future__ import annotations
+import os, sys, time, tempfile, urllib.request, argparse, platform
 from dataclasses import dataclass
-from typing import Optional
+from pathlib import Path
+from typing import Iterable, Optional
+from collections import deque
+import statistics as stats
 
+import cv2
 import mediapipe as mp
+from mediapipe.tasks import python
+from mediapipe.tasks.python import vision
 
-# ───────────────────────── Config ─────────────────────────
+
+# ───────────────────────────── Config ─────────────────────────────
+
+DEFAULT_MODEL_URLS = [
+    # “full” = good accuracy; swap to _lite or _heavy if you prefer
+    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/latest/pose_landmarker_full.task",
+    "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task",
+]
+
+os.environ.setdefault("TF_CPP_MIN_LOG_LEVEL", "0")  # show delegate logs (optional)
+
+
 @dataclass
-class PoseConfig:
-    window_name: str = "Pose skeleton"
+class AppConfig:
+    model_path: Path
+    model_urls: list[str]
+    min_bytes: int = 1_000_000
+    delegate_preference: str = "gpu"  # auto | gpu | cpu
     camera_index: int = 0
-    flip_display: bool = False            # True → efecto espejo
-    model_complexity: int = 1             # 0=Lite, 1=Full, 2=Heavy
-    min_det_conf: float = 0.5
-    min_track_conf: float = 0.5
+    window_title: str = "Pose Landmarker (GPU si disponible)"
     draw_landmarks: bool = True
-    show_fps: bool = True
-    width: Optional[int] = None           # por ej. 1280
-    height: Optional[int] = None          # por ej. 720
+    max_poses: int = 1
+    min_pose_detection_confidence: float = 0.5
+    running_mode: vision.RunningMode = vision.RunningMode.VIDEO  # IMAGE | VIDEO | LIVE_STREAM
 
-# ───────────────────────── Core (inferencia + dibujo) ─────────────────────────
-class PoseTracker:
-    def __init__(self, cfg: PoseConfig):
-        self.cfg = cfg
-        self._mp_pose = mp.solutions.pose
-        self._mp_drawing = mp.solutions.drawing_utils
-        self._mp_styles = mp.solutions.drawing_styles
-        self._pose = None
 
-    def __enter__(self):
-        self._pose = self._mp_pose.Pose(
-            static_image_mode=False,
-            model_complexity=self.cfg.model_complexity,
-            enable_segmentation=False,
-            min_detection_confidence=self.cfg.min_det_conf,
-            min_tracking_confidence=self.cfg.min_track_conf,
-        )
-        return self
+# ─────────────────────── Utilidades de modelo ───────────────────────
 
-    def __exit__(self, exc_type, exc, tb):
-        if self._pose:
-            self._pose.close()
-        # cv2.destroyAllWindows() se hace afuera en el runner
+def ensure_file(path: Path, urls: Iterable[str], min_bytes: int = 1_000_000) -> Path:
+    """Descarga a `path` si no existe o parece truncado."""
+    if path.exists() and path.stat().st_size >= min_bytes:
+        return path
 
-    def process(self, bgr_frame):
-        """Devuelve results de MediaPipe para un frame BGR."""
-        rgb = cv2.cvtColor(bgr_frame, cv2.COLOR_BGR2RGB)
-        return self._pose.process(rgb)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    last_err: Optional[Exception] = None
+    for url in urls:
+        try:
+            print(f"Descargando modelo desde:\n  {url}")
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req) as r, \
+                 tempfile.NamedTemporaryFile("wb", delete=False, dir=str(path.parent)) as tmp:
+                total = int(r.headers.get("Content-Length") or 0)
+                read = 0
+                while True:
+                    chunk = r.read(256 * 1024)
+                    if not chunk:
+                        break
+                    tmp.write(chunk)
+                    read += len(chunk)
+                    if total:
+                        pct = int(read * 100 / total)
+                        print(f"\r  {read}/{total} bytes ({pct}%)", end="")
+            print()
+            tmp_path = Path(tmp.name)
 
-    def draw(self, frame, results):
-        """Dibuja el esqueleto sobre frame (BGR)."""
-        if not results.pose_landmarks or not self.cfg.draw_landmarks:
-            return
-        self._mp_drawing.draw_landmarks(
-            frame,
-            results.pose_landmarks,
-            self._mp_pose.POSE_CONNECTIONS,
-            landmark_drawing_spec=self._mp_styles.get_default_pose_landmarks_style(),
-        )
+            if tmp_path.stat().st_size < min_bytes:
+                tmp_path.unlink(missing_ok=True)
+                raise IOError("El archivo descargado parece demasiado pequeño.")
 
-# ───────────────────────── Utilidades de UI ─────────────────────────
-def put_fps(frame, fps: float, org=(10, 30)):
-    text = f"FPS: {fps:.1f}"
-    cv2.putText(frame, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2, cv2.LINE_AA)
+            tmp_path.replace(path)
+            print(f"Modelo guardado en: {path}\n")
+            return path
 
-def window_is_closed(win_name: str) -> bool:
-    try:
-        return cv2.getWindowProperty(win_name, cv2.WND_PROP_VISIBLE) < 1
-    except cv2.error:
-        return True
+        except Exception as e:
+            last_err = e
+            print(f"  Falló con {e!r}. Probando siguiente URL...\n")
 
-# ───────────────────────── Runners ─────────────────────────
-def run_webcam(cfg: PoseConfig):
-    cap = cv2.VideoCapture(cfg.camera_index)
-    if cfg.width:  cap.set(cv2.CAP_PROP_FRAME_WIDTH, cfg.width)
-    if cfg.height: cap.set(cv2.CAP_PROP_FRAME_HEIGHT, cfg.height)
-
-    cv2.namedWindow(cfg.window_name, cv2.WINDOW_NORMAL)
-
-    prev = time.time()
-    fps = 0.0
-
-    with PoseTracker(cfg) as tracker:
-        while cap.isOpened():
-            ok, frame = cap.read()
-            if not ok:
-                break
-
-            if cfg.flip_display:
-                frame = cv2.flip(frame, 1)
-
-            results = tracker.process(frame)
-            tracker.draw(frame, results)
-
-            # FPS simple
-            now = time.time()
-            dt = now - prev
-            prev = now
-            if dt > 0:
-                # amortiguar un poco
-                fps = 0.9 * fps + 0.1 * (1.0 / dt)
-            if cfg.show_fps:
-                put_fps(frame, fps)
-
-            cv2.imshow(cfg.window_name, frame)
-
-            key = cv2.waitKey(1) & 0xFF
-            if key == 27:  # ESC
-                break
-            if window_is_closed(cfg.window_name):
-                break
-
-    cap.release()
-    cv2.destroyAllWindows()
-
-def run_on_video(input_path: str, cfg: PoseConfig, output_path: Optional[str] = None):
-    cap = cv2.VideoCapture(input_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"No se pudo abrir el video: {input_path}")
-
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = None
-
-    cv2.namedWindow(cfg.window_name, cv2.WINDOW_NORMAL)
-    prev = time.time()
-    fps_vis = 0.0
-
-    with PoseTracker(cfg) as tracker:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-
-            if cfg.flip_display:
-                frame = cv2.flip(frame, 1)
-
-            results = tracker.process(frame)
-            tracker.draw(frame, results)
-
-            # FPS visual
-            now = time.time()
-            dt = now - prev
-            prev = now
-            if dt > 0:
-                fps_vis = 0.9 * fps_vis + 0.1 * (1.0 / dt)
-            if cfg.show_fps:
-                put_fps(frame, fps_vis)
-
-            # Inicializa writer con el tamaño del primer frame
-            if output_path and writer is None:
-                h, w = frame.shape[:2]
-                writer = cv2.VideoWriter(output_path, fourcc, 30, (w, h), True)
-
-            if writer:
-                writer.write(frame)
-
-            cv2.imshow(cfg.window_name, frame)
-            key = cv2.waitKey(1) & 0xFF
-            if key == 27 or window_is_closed(cfg.window_name):
-                break
-
-    if writer:
-        writer.release()
-    cap.release()
-    cv2.destroyAllWindows()
-
-def run_on_image(image_path: str, cfg: PoseConfig, save_path: Optional[str] = None):
-    img = cv2.imread(image_path)
-    if img is None:
-        raise RuntimeError(f"No se pudo leer la imagen: {image_path}")
-
-    if cfg.flip_display:
-        img = cv2.flip(img, 1)
-
-    with PoseTracker(cfg) as tracker:
-        results = tracker.process(img)
-        tracker.draw(img, results)
-
-    if cfg.show_fps:
-        put_fps(img, 0.0)
-
-    cv2.imshow(cfg.window_name, img)
-    cv2.waitKey(0)
-    cv2.destroyAllWindows()
-
-    if save_path:
-        cv2.imwrite(save_path, img)
-
-# ───────────────────────── Main (ejemplos) ─────────────────────────
-if __name__ == "__main__":
-    # 1) Webcam
-    cfg = PoseConfig(
-        window_name="Pose skeleton",
-        camera_index=0,
-        flip_display=True,
-        model_complexity=1,
-        min_det_conf=0.5,
-        min_track_conf=0.5,
-        draw_landmarks=True,
-        show_fps=True,
-        # width=1280, height=720,
+    raise FileNotFoundError(
+        f"No se pudo descargar el modelo a {path}. Último error: {last_err}. "
+        f"Exporta POSE_LANDMARKER_PATH apuntando a un .task válido para omitir la descarga."
     )
-    run_webcam(cfg)
 
-    # 2) Video file (descomenta para usar)
-    # run_on_video(r"C:\ruta\a\video.mp4", cfg, output_path=r"C:\ruta\salida.mp4")
 
-    # 3) Imagen estática (descomenta para usar)
-    # run_on_image(r"C:\ruta\a\imagen.jpg", cfg, save_path=r"C:\ruta\salida.jpg")
+# ─────────────────────── Landmarker (GPU→CPU) ───────────────────────
+
+class LandmarkerFactory:
+    def __init__(self, cfg: AppConfig):
+        self.cfg = cfg
+
+    def _create(self, use_gpu: bool):
+        delegate = python.BaseOptions.Delegate.GPU if use_gpu else python.BaseOptions.Delegate.CPU
+        base_opts = python.BaseOptions(model_asset_path=str(self.cfg.model_path), delegate=delegate)
+        opts = vision.PoseLandmarkerOptions(
+            base_options=base_opts,
+            running_mode=self.cfg.running_mode,
+            num_poses=self.cfg.max_poses,
+            min_pose_detection_confidence=self.cfg.min_pose_detection_confidence,
+            # Optional extra thresholds if you want:
+            # min_pose_presence_confidence=0.5,
+            # min_tracking_confidence=0.5,
+        )
+        return vision.PoseLandmarker.create_from_options(opts)
+
+    def create_with_fallback(self):
+        pref = self.cfg.delegate_preference.lower()
+        if pref == "cpu":
+            lm = self._create(use_gpu=False)
+            print("Pose Landmarker: delegado CPU habilitado")
+            return lm
+
+        if pref == "gpu":
+            lm = self._create(use_gpu=True)
+            print("Pose Landmarker: delegado GPU habilitado")
+            return lm
+
+        # auto: intentar GPU y caer a CPU si falla
+        try:
+            lm = self._create(use_gpu=True)
+            print("Pose Landmarker: delegado GPU habilitado")
+            return lm
+        except Exception as gpu_err:
+            print(f"Delegado GPU falló ({gpu_err}). Cambiando a CPU…")
+            lm = self._create(use_gpu=False)
+            print("Pose Landmarker: delegado CPU habilitado")
+            return lm
+
+
+# ─────────────────────── Métricas de rendimiento ───────────────────────
+
+@dataclass
+class PerfSnapshot:
+    fps: float
+    infer_ms: float
+    e2e_ms: float
+
+
+class PerfMeter:
+    """Mide por segundo y también agrega métricas globales ponderadas por frame."""
+    def __init__(self, warmup_sec: float = 2.0):
+        self.last_report_t = time.perf_counter()
+        self.frames_since = 0
+        self.sum_infer_ms_win = 0.0
+        self.sum_e2e_ms_win = 0.0
+        self.last_snapshot = PerfSnapshot(0.0, 0.0, 0.0)
+
+        # Globales
+        self.start_t = self.last_report_t
+        self.total_frames = 0
+        self.total_infer_ms = 0.0
+        self.total_e2e_ms = 0.0
+
+        # Warm-up
+        self.warmup_sec = warmup_sec
+        self._warmup_done = False
+
+        # Buffers para percentiles (opcional)
+        self._infer_samples = deque(maxlen=60_000)  # ~muchos frames
+        self._e2e_samples = deque(maxlen=60_000)
+
+    def push(self, infer_ms: float, e2e_ms: float) -> PerfSnapshot:
+        now = time.perf_counter()
+
+        # Ventana de 1s para logs en vivo
+        self.frames_since += 1
+        self.sum_infer_ms_win += infer_ms
+        self.sum_e2e_ms_win += e2e_ms
+
+        # Warm-up gate
+        if not self._warmup_done and (now - self.start_t) >= self.warmup_sec:
+            # a partir de aquí contamos globales
+            self._warmup_done = True
+
+        if self._warmup_done:
+            # Globales ponderadas por frame
+            self.total_frames += 1
+            self.total_infer_ms += infer_ms
+            self.total_e2e_ms += e2e_ms
+            # Para percentiles
+            self._infer_samples.append(infer_ms)
+            self._e2e_samples.append(e2e_ms)
+
+        elapsed = now - self.last_report_t
+        if elapsed >= 1.0:
+            fps = self.frames_since / elapsed
+            avg_inf = self.sum_infer_ms_win / self.frames_since
+            avg_e2e = self.sum_e2e_ms_win / self.frames_since
+            self.last_snapshot = PerfSnapshot(fps, avg_inf, avg_e2e)
+
+            print(f"FPS: {fps:.1f} | infer(avg): {avg_inf:.1f} ms | e2e(avg): {avg_e2e:.1f} ms")
+
+            # reset ventana 1s
+            self.frames_since = 0
+            self.sum_infer_ms_win = 0.0
+            self.sum_e2e_ms_win = 0.0
+            self.last_report_t = now
+
+        return self.last_snapshot
+
+    def summary(self) -> dict:
+        end_t = time.perf_counter()
+        dur = max(1e-9, end_t - self.start_t - self.warmup_sec)  # sin warm-up
+
+        if self.total_frames == 0:
+            return {
+                "frames": 0,
+                "duration_s": max(0.0, dur),
+                "fps_global": 0.0,
+                "infer_ms_global": float("nan"),
+                "e2e_ms_global": float("nan"),
+                "infer_ms_p50": float("nan"),
+                "infer_ms_p90": float("nan"),
+                "e2e_ms_p50": float("nan"),
+                "e2e_ms_p90": float("nan"),
+            }
+
+        fps_global = self.total_frames / dur
+        infer_ms_global = self.total_infer_ms / self.total_frames
+        e2e_ms_global = self.total_e2e_ms / self.total_frames
+
+        def pct(vals, q):
+            if not vals: return float("nan")
+            return float(stats.quantiles(vals, n=100, method="inclusive")[q-1])
+
+        return {
+            "frames": self.total_frames,
+            "duration_s": dur,
+            "fps_global": fps_global,
+            "infer_ms_global": infer_ms_global,
+            "e2e_ms_global": e2e_ms_global,
+            "infer_ms_p50": stats.median(self._infer_samples) if self._infer_samples else float("nan"),
+            "infer_ms_p90": pct(list(self._infer_samples), 90),
+            "e2e_ms_p50": stats.median(self._e2e_samples) if self._e2e_samples else float("nan"),
+            "e2e_ms_p90": pct(list(self._e2e_samples), 90),
+        }
+
+
+# ─────────────────────── Dibujo y overlay ───────────────────────
+
+def draw_pose_skeleton_bgr(frame_bgr, result) -> None:
+    """Dibuja el esqueleto (POSE_CONNECTIONS) de todas las poses detectadas."""
+    if not result or not getattr(result, "pose_landmarks", None):
+        return
+
+    h, w = frame_bgr.shape[:2]
+    connections = mp.solutions.pose.POSE_CONNECTIONS  # pares de índices
+
+    for lms in result.pose_landmarks:  # lista de poses
+        pts = [(int(lm.x * w), int(lm.y * h)) for lm in lms]
+
+        # Dibujar conexiones (líneas)
+        for a, b in connections:
+            pa, pb = pts[a], pts[b]
+            cv2.line(frame_bgr, pa, pb, (0, 255, 0), 2, cv2.LINE_AA)
+
+        # Dibujar puntos
+        for x, y in pts:
+            cv2.circle(frame_bgr, (x, y), 2, (0, 255, 0), -1)
+
+
+def put_overlay(frame_bgr, snap: PerfSnapshot) -> None:
+    txt = f"FPS {snap.fps:.1f} | infer {snap.infer_ms:.1f} ms | e2e {snap.e2e_ms:.1f} ms"
+    cv2.putText(frame_bgr, txt, (10, 24),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
+
+
+# ─────────────────────── Cámara ───────────────────────
+
+def open_camera(index: int) -> cv2.VideoCapture:
+    """Intenta abrir la cámara con un backend apropiado y cae a 'default' si falla."""
+    sysname = platform.system().lower()
+    tried = []
+
+    def _try(backend):
+        cap = cv2.VideoCapture(index, backend)
+        tried.append(backend)
+        return cap if cap.isOpened() else None
+
+    if "windows" in sysname:
+        cap = _try(cv2.CAP_DSHOW) or cv2.VideoCapture(index)
+    elif "linux" in sysname:
+        cap = _try(cv2.CAP_V4L2) or cv2.VideoCapture(index)
+    else:
+        cap = cv2.VideoCapture(index)
+
+    if not cap or not cap.isOpened():
+        raise RuntimeError(f"No se pudo abrir la cámara index={index} (tried backends: {tried or ['default']})")
+    return cap
+
+
+# ─────────────────────── Bucle principal ───────────────────────
+
+def run_webcam(cfg: AppConfig) -> None:
+    # Preparar modelo (descarga si hace falta)
+    ensure_file(cfg.model_path, cfg.model_urls, cfg.min_bytes)
+
+    # Crear landmarker con GPU→CPU (según preferencia)
+    landmarker = LandmarkerFactory(cfg).create_with_fallback()
+
+    cap = open_camera(cfg.camera_index)
+
+    # Intentar pedir formato + resolución + FPS (puede que el driver ignore)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'YUYV'))  # o 'MJPG' si tu cámara lo soporta
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+
+    # Verifica lo aplicado por el driver
+    w = cap.get(cv2.CAP_PROP_FRAME_WIDTH)
+    h = cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    print(f"Solicitado 640x480@30 → Aplicado {int(w)}x{int(h)}@{fps:.2f} FPS")
+
+    perf = PerfMeter()
+    t0 = time.perf_counter()  # base para timestamps de VIDEO (ms crecientes)
+
+    try:
+        while True:
+            t_frame_start = time.perf_counter()
+
+            ok, frame = cap.read()
+            if not ok:
+                print("Fin de cámara / no hay frames.")
+                break
+
+            ts_ms = int((time.perf_counter() - t0) * 1000.0)  # ms crecientes para VIDEO
+
+            # MediaPipe Tasks espera RGB
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
+            # Inferencia
+            t_inf_start = time.perf_counter()
+            result = landmarker.detect_for_video(mp_image, ts_ms)
+            t_inf_end = time.perf_counter()
+            infer_ms = (t_inf_end - t_inf_start) * 1000.0
+
+            # Dibujo
+            if cfg.draw_landmarks:
+                draw_pose_skeleton_bgr(frame, result)
+
+            # E2E
+            t_frame_end = time.perf_counter()
+            e2e_ms = (t_frame_end - t_frame_start) * 1000.0
+
+            # Métricas por segundo
+            snap = perf.push(infer_ms, e2e_ms)
+
+            # Overlay
+            put_overlay(frame, snap)
+
+            cv2.imshow(cfg.window_title, frame)
+            if cv2.waitKey(1) & 0xFF == 27:  # ESC
+                break
+
+    finally:
+        cap.release()
+        cv2.destroyAllWindows()
+        summary = perf.summary()
+        print("\n=== Resumen global (sin warm-up) ===")
+        print(f"Frames: {summary['frames']} | Duración: {summary['duration_s']:.2f} s")
+        print(f"FPS global: {summary['fps_global']:.2f}")
+        print(f"Infer: {summary['infer_ms_global']:.2f} ms (P50 {summary['infer_ms_p50']:.2f}, P90 {summary['infer_ms_p90']:.2f})")
+        print(f"E2E  : {summary['e2e_ms_global']:.2f} ms (P50 {summary['e2e_ms_p50']:.2f}, P90 {summary['e2e_ms_p90']:.2f})")
+
+
+# ─────────────────────── CLI ───────────────────────
+
+def build_cfg_from_args() -> AppConfig:
+    here = Path(__file__).resolve().parent
+    root = here.parent if here.name == "tests" else here
+    default_model = root / "models" / "pose_landmarker.task"
+    default_model = Path(os.getenv("POSE_LANDMARKER_PATH", str(default_model)))
+
+    p = argparse.ArgumentParser(description="MediaPipe Pose Landmarker (modular)")
+    p.add_argument("--model", type=Path, default=default_model, help="Ruta del .task")
+    p.add_argument("--camera", type=int, default=0, help="Índice de cámara (default: 0)")
+    p.add_argument("--delegate", choices=["auto", "gpu", "cpu"], default="auto",
+                   help="Preferencia de delegado TFLite (default: auto)")
+    p.add_argument("--max-poses", type=int, default=1)
+    p.add_argument("--min-conf", type=float, default=0.5, help="Min pose detection confidence")
+    p.add_argument("--no-draw", action="store_true", help="No dibujar esqueleto")
+    p.add_argument("--title", type=str, default="Pose Landmarker (GPU si disponible)")
+
+    args = p.parse_args()
+
+    # Asegura carpeta del modelo
+    args.model.parent.mkdir(parents=True, exist_ok=True)
+
+    return AppConfig(
+        model_path=args.model,
+        model_urls=list(DEFAULT_MODEL_URLS),
+        delegate_preference=args.delegate,
+        camera_index=args.camera,
+        window_title=args.title,
+        draw_landmarks=not args.no_draw,
+        max_poses=args.max_poses,
+        min_pose_detection_confidence=args.min_conf,
+    )
+
+
+def main():
+    try:
+        cfg = build_cfg_from_args()
+        run_webcam(cfg)
+    except KeyboardInterrupt:
+        print("\nInterrumpido por el usuario.")
+    except Exception as e:
+        print(f"\nError: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

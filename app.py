@@ -344,43 +344,6 @@ def _poses_px_from_result(result, img_shape) -> Tuple[int, int, List[List[Tuple[
         poses_px.append(pts)
     return w, h, poses_px
 
-
-# ─────────────── HTTP: /pose ───────────────
-@app.post("/pose")
-async def pose_handler(request):
-    mode = (request.args.get("mode") or "json").lower()
-    if mode not in {"json", "image"}:
-        raise InvalidUsage("Parámetro mode debe ser 'json' o 'image'.")
-
-    img = _decode_image_from_request(request)
-    want_image = (mode == "image")
-    jpeg_bytes, result = await _process_pose(img, return_image=want_image)
-
-    if want_image:
-        return response.raw(jpeg_bytes, content_type="image/jpeg")
-    else:
-        payload = _results_pose_to_json(result, img.shape)
-        return response.json(payload)
-
-
-# ─────────────── HTTP: /face ───────────────
-@app.post("/face")
-async def face_handler(request):
-    mode = (request.args.get("mode") or "json").lower()
-    if mode not in {"json", "image"}:
-        raise InvalidUsage("Parámetro mode debe ser 'json' o 'image'.")
-
-    img = _decode_image_from_request(request)
-    want_image = (mode == "image")
-    jpeg_bytes, result = await _process_face(img, return_image=want_image)
-
-    if want_image:
-        return response.raw(jpeg_bytes, content_type="image/jpeg")
-    else:
-        payload = _results_face_to_json(result, img.shape)
-        return response.json(payload)
-
-
 # ─────────────── WebSocket: echo (/ws) ───────────────
 @app.websocket("/ws")
 async def websocket_handler(request, ws):

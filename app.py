@@ -318,12 +318,48 @@ def pack_pose_frame(image_w: int, image_h: int, poses: List[List[Tuple[int, int]
     out += struct.pack("<HH", image_w, image_h)
 
     for pts in poses:
-      out += bytes([len(pts)])
-      for (x, y) in pts:
-        # clamp to image bounds; uint16 pixel coords
-        out += struct.pack("<HH", max(0, min(65535, x)), max(0, min(65535, y)))
+        out += bytes([len(pts)])
+        for (x, y) in pts:
+            # clamp to image bounds; uint16 pixel coords
+            out += struct.pack("<HH", max(0, min(65535, x)), max(0, min(65535, y)))
     return bytes(out)
 
+# --- add alongside pack_pose_frame ---
+def pack_pose_frame_delta(prev: list[list[tuple[int,int]]] | None,
+                          curr: list[list[tuple[int,int]]],
+                          image_w: int, image_h: int,
+                          keyframe: bool) -> bytes:
+    # Header: 'P''D', ver=0, flags(bit0=keyframe), numPoses, w, h
+    out = bytearray(b"PD")
+    out += bytes([0])  # ver
+    out += bytes([1 if keyframe else 0])
+    out += bytes([len(curr)])
+    out += struct.pack("<HH", image_w, image_h)
+
+    if keyframe or not prev or len(prev)!=len(curr):
+        # keyframe falls back to absolute (same as 'PO' but with 'PD' tag)
+        for pts in curr:
+            out += bytes([len(pts)])
+            for (x,y) in pts:
+                out += struct.pack("<HH", x, y)
+        return bytes(out)
+
+    # delta frame: for each pose -> nPts, bitmask of changed points, then deltas
+    for p, cpose in enumerate(curr):
+        out += bytes([len(cpose)])
+        pmask = 0
+        for i,(x,y) in enumerate(cpose):
+            px,py = prev[p][i]
+            if x!=px or y!=py:
+                pmask |= (1<<i)
+        # 33 points -> fits in 64-bit; write as u64
+        out += struct.pack("<Q", pmask)
+        for i,(x,y) in enumerate(cpose):
+            if (pmask>>i) & 1:
+                dx = max(-127, min(127, x - prev[p][i][0]))
+                dy = max(-127, min(127, y - prev[p][i][1]))
+                out += struct.pack("<bb", dx, dy)
+    return bytes(out)
 
 def _poses_px_from_result(result, img_shape) -> Tuple[int, int, List[List[Tuple[int, int]]]]:
     """Extrae listas de (px,py) como enteros desde PoseLandmarkerResult."""
@@ -343,6 +379,7 @@ def _poses_px_from_result(result, img_shape) -> Tuple[int, int, List[List[Tuple[
             pts.append((x, y))
         poses_px.append(pts)
     return w, h, poses_px
+
 
 # ─────────────── WebSocket: echo (/ws) ───────────────
 @app.websocket("/ws")
@@ -422,7 +459,7 @@ async def ws_face(request, ws):
     print(">>> WS/face desconectado.")
 
 
-# ─────────────── WebRTC: signaling + transform track ───────────────
+# ─────────────── WebRTC: transform track (kept for reference; not used to send back video) ───────────────
 class PoseTransformTrack(MediaStreamTrack):
     kind = "video"
 
@@ -432,59 +469,92 @@ class PoseTransformTrack(MediaStreamTrack):
         self._pc = pc
 
     async def recv(self) -> av.VideoFrame:
+        # NOTE: This class is kept for reference but is NOT added to the PC.
+        # Therefore, it will not be used. We keep it in case you want to
+        # re-enable server->client video later.
         frame: av.VideoFrame = await self._track.recv()
-        img_bgr = frame.to_ndarray(format="bgr24")
+        return frame
 
-        result = None
+
+# ─────────────── NEW: consume incoming video without sending a remote stream ───────────────
+async def _consume_incoming_video(track: MediaStreamTrack, pc: RTCPeerConnection):
+    """Consumes the client's video track, runs pose, and pushes results via DataChannel.
+    No media is sent back to the client (no remote video track).
+    """
+    global pose_lock, pose_landmarker_video, pose_landmarker_image
+
+    subscribed = relay.subscribe(track)
+
+    # ── Delta-packet state (per PC) ─────────────────────────────────────────────
+    last_poses_px: List[List[Tuple[int, int]]] | None = None
+    last_key_ms: int = 0
+    KEYFRAME_INTERVAL_MS = 1000  # send absolute coords at least once per second
+    SEND_THRESHOLD = 64_000      # back-pressure guard for DataChannel
+
+    while True:
         try:
-            # latest-only: si hay una inferencia en curso, no bloquees: pasa el frame
-            if pose_lock is not None and pose_lock.locked():
-                return frame
+            frame: av.VideoFrame = await subscribed.recv()
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            # Track ended or PC closed
+            break
 
-            # MediaPipe Tasks espera RGB
-            rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            ts_ms = int(time.time() * 1000)
+        # Fetch results channel; if not ready or congested, skip compute early
+        dc = results_dc_by_pc.get(pc)
+        if not dc or getattr(dc, "readyState", "") != "open":
+            continue
+        if getattr(dc, "bufferedAmount", 0) >= SEND_THRESHOLD:
+            # Drop this frame to keep latest-only behavior under load
+            continue
 
+        # latest-only: if an inference is in progress, skip this frame BEFORE any conversions
+        if pose_lock is not None and pose_lock.locked():
+            continue
+
+        ts_ms = int(time.time() * 1000)
+
+        try:
+            # ==== Run inference (convert only when we're sure we'll process) ====
             async with pose_lock:
+                img_bgr = frame.to_ndarray(format="bgr24")
+                # MediaPipe Tasks expects RGB
+                rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+
                 if pose_landmarker_video is not None:
                     result = pose_landmarker_video.detect_for_video(mp_image, ts_ms)
                 else:
-                    # fallback (no debería ocurrir)
+                    # Fallback to IMAGE mode if VIDEO is unavailable
                     result = pose_landmarker_image.detect(mp_image)
 
-            # Envío de resultados por DataChannel: binario (rápido) o JSON (fallback)
-            dc = results_dc_by_pc.get(self._pc)
-            if dc and getattr(dc, "readyState", "") == "open":
-                # Evita congestión: si hay demasiado en búfer, salta este envío
-                if getattr(dc, "bufferedAmount", 0) < 64_000:
-                    if WEBRTC_JSON_RESULTS:
-                        payload = _results_pose_to_json(result, img_bgr.shape)
-                        payload["ts_ms"] = ts_ms
-                        dc.send(json.dumps(payload))
-                    else:
-                        w, h, poses_px = _poses_px_from_result(result, img_bgr.shape)
-                        packet = pack_pose_frame(w, h, poses_px)
-                        dc.send(packet)
+            # ==== Send results via DataChannel ====
+            if WEBRTC_JSON_RESULTS:
+                payload = _results_pose_to_json(result, img_bgr.shape)
+                payload["ts_ms"] = ts_ms
+                # json dumps can be heavy; keep it simple (or swap to orjson where available)
+                dc.send(json.dumps(payload))
+            else:
+                w, h, poses_px = _poses_px_from_result(result, img_bgr.shape)
+
+                # Prefer delta packets when available; fall back to absolute
+                packet = None
+                if "pack_pose_frame_delta" in globals():
+                    keyframe = (last_poses_px is None) or ((ts_ms - last_key_ms) >= KEYFRAME_INTERVAL_MS)
+                    packet = globals()["pack_pose_frame_delta"](last_poses_px, poses_px, w, h, keyframe)
+                    if keyframe:
+                        last_key_ms = ts_ms
+                    last_poses_px = poses_px
+                else:
+                    packet = pack_pose_frame(w, h, poses_px)
+
+                # Guard again just before send (buffer may have grown)
+                if getattr(dc, "bufferedAmount", 0) < SEND_THRESHOLD:
+                    dc.send(packet)
 
         except Exception as e:
             logger.warning("Pose processing error: %s", e)
-
-        if not WEBRTC_ANNOTATE:
-            return frame
-
-        # Anotar el frame usando el resultado ya calculado (si existe)
-        overlay = img_bgr.copy()
-        try:
-            if result is not None:
-                draw_pose_skeleton_bgr(overlay, result)
-        except Exception as e:
-            logger.warning("Annotation error: %s", e)
-            overlay = img_bgr
-
-        out = av.VideoFrame.from_ndarray(overlay, format="bgr24")
-        out.pts, out.time_base = frame.pts, frame.time_base
-        return out
+            continue
 
 
 def _rtc_configuration() -> RTCConfiguration:
@@ -542,7 +612,10 @@ async def webrtc_offer(request):
     def on_track(track):
         logger.info("Track %s received (kind=%s) on PC %s", track.id, track.kind, id(pc))
         if track.kind == "video":
-            pc.addTrack(PoseTransformTrack(track, pc))
+            # IMPORTANT: Do NOT send a remote stream back.
+            # Instead, consume the incoming video and push results over DataChannel.
+            asyncio.create_task(_consume_incoming_video(track, pc))
+            # (Removed) pc.addTrack(PoseTransformTrack(track, pc))
 
     @pc.on("connectionstatechange")
     async def on_state_change():

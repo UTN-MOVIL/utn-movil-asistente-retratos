@@ -63,6 +63,8 @@ face_lock: asyncio.Lock | None = None
 pcs: Set[RTCPeerConnection] = set()
 relay = MediaRelay()
 results_dc_by_pc: Dict[RTCPeerConnection, object] = {}
+ctrl_dc_by_pc: Dict[RTCPeerConnection, object] = {}
+need_keyframe_by_pc: Dict[RTCPeerConnection, bool] = {}
 
 WEBRTC_ANNOTATE = os.getenv("WEBRTC_ANNOTATE", "0") == "1"
 WEBRTC_JSON_RESULTS = os.getenv("WEBRTC_JSON_RESULTS", "0") == "1"
@@ -164,6 +166,8 @@ async def _cleanup(app, loop):
             pass
     pcs.clear()
     results_dc_by_pc.clear()
+    ctrl_dc_by_pc.clear()
+    need_keyframe_by_pc.clear()
     logger.info("RTCPeerConnections cerrados.")
 
 # ─────────────── Helpers ───────────────
@@ -286,17 +290,24 @@ def pack_pose_frame(image_w: int, image_h: int, poses: List[List[Tuple[int, int]
             out += struct.pack("<HH", max(0, min(65535, x)), max(0, min(65535, y)))
     return bytes(out)
 
-def pack_pose_frame_delta(prev: list[list[tuple[int,int]]] | None,
-                          curr: list[list[tuple[int,int]]],
-                          image_w: int, image_h: int,
-                          keyframe: bool) -> bytes:
+def pack_pose_frame_delta(
+    prev: list[list[tuple[int, int]]] | None,
+    curr: list[list[tuple[int, int]]],
+    image_w: int,
+    image_h: int,
+    keyframe: bool
+) -> bytes:
+    # If absolute body is needed, force the header flag too.
+    absolute_needed = (prev is None) or (len(prev) != len(curr))
+    keyframe = keyframe or absolute_needed
+
     out = bytearray(b"PD")
-    out += bytes([0])  # ver
-    out += bytes([1 if keyframe else 0])
+    out += bytes([0])                      # ver
+    out += bytes([1 if keyframe else 0])   # flags
     out += bytes([len(curr)])
     out += struct.pack("<HH", image_w, image_h)
 
-    if keyframe or not prev or len(prev) != len(curr):
+    if keyframe:
         for pts in curr:
             out += bytes([len(pts)])
             for (x, y) in pts:
@@ -416,19 +427,51 @@ class PoseTransformTrack(MediaStreamTrack):
         frame: av.VideoFrame = await self._track.recv()
         return frame
 
-def _make_results_dc(pc: RTCPeerConnection):
-    # Use partial reliability by time to let stale chunks expire
-    dc = pc.createDataChannel(
-        "results",
-        ordered=False,
-        maxPacketLifeTime=200,  # ~200 ms lifetime
-    )
+def _wire_results_dc_handlers(pc, dc):
     @dc.on("open")
     def _on_open():
         logger.info("DataChannel 'results' open on PC %s", id(pc))
     @dc.on("close")
     def _on_close():
         logger.info("DataChannel 'results' closed on PC %s", id(pc))
+    @dc.on("message")
+    def _on_message(msg):
+        # Back-compat: accept "KF" here too, though normal path is 'ctrl'
+        try:
+            if isinstance(msg, str) and msg.strip().upper() == "KF":
+                need_keyframe_by_pc[pc] = True
+                logger.info("Client requested keyframe via 'results' (PC %s)", id(pc))
+        except Exception:
+            pass
+    return dc
+
+def _wire_ctrl_dc_handlers(pc, dc):
+    @dc.on("open")
+    def _on_open():
+        logger.info("DataChannel 'ctrl' open on PC %s", id(pc))
+    @dc.on("close")
+    def _on_close():
+        logger.info("DataChannel 'ctrl' closed on PC %s", id(pc))
+    @dc.on("message")
+    def _on_message(msg):
+        try:
+            if isinstance(msg, str) and msg.strip().upper() == "KF":
+                need_keyframe_by_pc[pc] = True
+                logger.info("KF requested via 'ctrl' (PC %s)", id(pc))
+        except Exception:
+            pass
+    return dc
+
+def _make_results_dc(pc: RTCPeerConnection):
+    # Unordered + lossy to avoid head-of-line blocking on deltas
+    dc = pc.createDataChannel("results", ordered=False, maxRetransmits=0)
+    _wire_results_dc_handlers(pc, dc)
+    return dc
+
+def _make_ctrl_dc(pc: RTCPeerConnection):
+    # Reliable channel for control messages
+    dc = pc.createDataChannel("ctrl", ordered=True)
+    _wire_ctrl_dc_handlers(pc, dc)
     return dc
 
 def _recycle_results_dc(pc: RTCPeerConnection):
@@ -438,8 +481,9 @@ def _recycle_results_dc(pc: RTCPeerConnection):
             old.close()
     except Exception:
         pass
-    logger.info("Recreating congested 'results' DataChannel on PC %s", id(pc))
-    return _make_results_dc(pc)
+    logger.info("Recreating 'results' DataChannel on PC %s", id(pc))
+    dc = _make_results_dc(pc)
+    return dc
 
 async def _consume_incoming_video(track: MediaStreamTrack, pc: RTCPeerConnection):
     """Consumes client video, runs pose, and pushes results via DataChannel."""
@@ -451,14 +495,16 @@ async def _consume_incoming_video(track: MediaStreamTrack, pc: RTCPeerConnection
     last_poses_px: List[List[Tuple[int,int]]] | None = None
     last_key_ms = 0
     last_sent_ms = 0
-    KEYFRAME_INTERVAL_MS = 1000     # keyframe at least once per second
+    KEYFRAME_INTERVAL_MS = 600      # slightly more aggressive
     MIN_SEND_MS = 66                # ~15 fps when healthy
 
-    # ── UPDATED SEND/RECYCLE LOGIC ─────────────────────────────────────────────
-    SEND_THRESHOLD = 128_000        # lower threshold for 'too much queued'
-    RECYCLE_AFTER_MS = 400          # recycle faster if stuck above threshold
+    # ── Congestion control ───────────────────────────────────────────────────
+    SEND_THRESHOLD = 32_768
+    RECYCLE_AFTER_MS = 300
     congested_since_ms: Optional[int] = None
-    # ──────────────────────────────────────────────────────────────────────────
+    # ─────────────────────────────────────────────────────────────────────────
+
+    last_ts_input = 0
 
     while True:
         try:
@@ -472,30 +518,30 @@ async def _consume_incoming_video(track: MediaStreamTrack, pc: RTCPeerConnection
         if not dc or getattr(dc, "readyState", "") != "open":
             continue
 
-        # Monotonic timestamp (avoid wall-clock jumps)
-        ts_ms = (
-            int(frame.time * 1000) if getattr(frame, "time", None) is not None
-            else int(time.monotonic() * 1000)
-        )
+        ts_ms = int(time.monotonic() * 1000)
+        if ts_ms <= last_ts_input:
+            ts_ms = last_ts_input + 1
+        last_ts_input = ts_ms
 
         buf = getattr(dc, "bufferedAmount", 0)
 
-        # ── Replacement for previous HARD/LW logic ────────────────────────────
+        # Congestion handling & recycle
         if buf >= SEND_THRESHOLD:
             congested_since_ms = congested_since_ms or ts_ms
             if (ts_ms - congested_since_ms) >= RECYCLE_AFTER_MS:
                 dc = _recycle_results_dc(pc)
                 results_dc_by_pc[pc] = dc
                 congested_since_ms = None
-            # Skip sending this iteration while congested
+                # Force a fresh keyframe after recycle
+                last_key_ms = 0
+                last_poses_px = None
+                need_keyframe_by_pc[pc] = True
             continue
         else:
             congested_since_ms = None
-        # ──────────────────────────────────────────────────────────────────────
 
-        # Adaptive pacing (healthy path)
-        target_interval = MIN_SEND_MS
-        if (ts_ms - last_sent_ms) < target_interval:
+        # Adaptive pacing
+        if (ts_ms - last_sent_ms) < MIN_SEND_MS:
             continue
 
         # latest-only: skip if inference is already running
@@ -523,8 +569,12 @@ async def _consume_incoming_video(track: MediaStreamTrack, pc: RTCPeerConnection
                     last_sent_ms = ts_ms
             else:
                 w, h, poses_px = _poses_px_from_result(result, img_bgr.shape)
-                # (No 'congested' flag here; we already early-continued if congested)
-                need_key = (ts_ms - last_key_ms) >= KEYFRAME_INTERVAL_MS
+
+                # Decide if a keyframe is needed
+                external_kf = bool(need_keyframe_by_pc.pop(pc, False))
+                force_key = (last_poses_px is None) or (len(last_poses_px) != len(poses_px))
+                gap_key = (ts_ms - last_sent_ms) > 250  # refresh sooner after gaps
+                need_key = external_kf or force_key or gap_key or ((ts_ms - last_key_ms) >= KEYFRAME_INTERVAL_MS)
 
                 if "pack_pose_frame_delta" in globals():
                     packet = globals()["pack_pose_frame_delta"](
@@ -534,6 +584,7 @@ async def _consume_incoming_video(track: MediaStreamTrack, pc: RTCPeerConnection
                         last_key_ms = ts_ms
                 else:
                     packet = pack_pose_frame(w, h, poses_px)
+                    last_key_ms = ts_ms  # 'PO' is absolute
 
                 if getattr(dc, "bufferedAmount", 0) < SEND_THRESHOLD:
                     dc.send(packet)
@@ -560,7 +611,7 @@ def _rtc_configuration() -> RTCConfiguration:
 
 @app.post("/webrtc/offer")
 async def webrtc_offer(request):
-    """Accepts SDP offer, returns SDP answer. Client adds a video track and a 'results' DataChannel."""
+    """Accepts SDP offer, returns SDP answer. Client adds a video track and data channels."""
     params = request.json or {}
     if "sdp" not in params or "type" not in params:
         raise InvalidUsage("Body JSON must contain 'sdp' and 'type'.")
@@ -570,17 +621,24 @@ async def webrtc_offer(request):
     pcs.add(pc)
     logger.info("Created PC %s", id(pc))
 
-    # Proactively create the results DataChannel (partial reliability by time)
+    # Proactively create both DataChannels
     try:
-        dc = _make_results_dc(pc)
-        results_dc_by_pc[pc] = dc
+        results_dc_by_pc[pc] = _make_results_dc(pc)  # unordered, lossy
+        ctrl_dc_by_pc[pc]    = _make_ctrl_dc(pc)     # reliable
     except Exception:
         pass
 
     @pc.on("datachannel")
     def on_dc(channel):
-        results_dc_by_pc[pc] = channel
-        logger.info("Data channel '%s' open on PC %s", channel.label, id(pc))
+        label = getattr(channel, "label", "")
+        if label == "results":
+            results_dc_by_pc[pc] = _wire_results_dc_handlers(pc, channel)
+            logger.info("Data channel 'results' open on PC %s", id(pc))
+        elif label == "ctrl":
+            ctrl_dc_by_pc[pc] = _wire_ctrl_dc_handlers(pc, channel)
+            logger.info("Data channel 'ctrl' open on PC %s", id(pc))
+        else:
+            logger.info("Unknown data channel '%s' on PC %s", label, id(pc))
 
     @pc.on("track")
     def on_track(track):
@@ -598,6 +656,8 @@ async def webrtc_offer(request):
             finally:
                 pcs.discard(pc)
                 results_dc_by_pc.pop(pc, None)
+                ctrl_dc_by_pc.pop(pc, None)
+                need_keyframe_by_pc.pop(pc, None)
 
     await pc.setRemoteDescription(offer)
     answer = await pc.createAnswer()

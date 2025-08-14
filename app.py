@@ -66,8 +66,17 @@ results_dc_by_pc: Dict[RTCPeerConnection, object] = {}
 ctrl_dc_by_pc: Dict[RTCPeerConnection, object] = {}
 need_keyframe_by_pc: Dict[RTCPeerConnection, bool] = {}
 
+# per-PC sequence for PD packets (detect loss/reorder on client)
+results_seq_by_pc: Dict[RTCPeerConnection, int] = {}
+
 WEBRTC_ANNOTATE = os.getenv("WEBRTC_ANNOTATE", "0") == "1"
-WEBRTC_JSON_RESULTS = os.getenv("WEBRTC_JSON_RESULTS", "0") == "1"
+WEBRTC_JSON_RESULTS = os.getenv("WEBRTC_JSON_RESULTS", "0") == "1"  # default 0 → binary PO/PD
+
+# ─────────────── Behaviour toggles (via env) ───────────────
+POSE_USE_VIDEO = os.getenv("POSE_USE_VIDEO", "0") == "1"  # default IMAGE for WebRTC path
+ABSOLUTE_INTERVAL_MS = int(os.getenv("ABSOLUTE_INTERVAL_MS", "0"))    # default off
+IDLE_TO_FORCE_KF_MS = int(os.getenv("IDLE_TO_FORCE_KF_MS", "500"))
+FRAME_GAP_WARN_MS = int(os.getenv("FRAME_GAP_WARN_MS", "180"))
 
 # ─────────────── Lifecycle ───────────────
 @app.listener("before_server_start")
@@ -100,17 +109,23 @@ async def _setup(app, loop):
     pose_landmarker_image = PoseLandmarkerFactory(pose_cfg_image).create_with_fallback()
     logger.info("PoseLandmarker (IMAGE) inicializado.")
 
-    # ---- Pose (VIDEO) para WebRTC ----
-    pose_cfg_video = PoseAppConfig(
-        model_path=POSE_MODEL_PATH,
-        model_urls=list(POSE_MODEL_URLS),
-        delegate_preference="gpu",
-        running_mode=mp_vision.RunningMode.VIDEO,  # WebRTC streaming
-        max_poses=1,
-        min_pose_detection_confidence=0.5,
-    )
-    pose_landmarker_video = PoseLandmarkerFactory(pose_cfg_video).create_with_fallback()
-    logger.info("PoseLandmarker (VIDEO) inicializado.")
+    # ---- Pose para WebRTC (VIDEO o IMAGE según env) ----
+    if POSE_USE_VIDEO:
+        pose_cfg_video = PoseAppConfig(
+            model_path=POSE_MODEL_PATH,
+            model_urls=list(POSE_MODEL_URLS),
+            delegate_preference="gpu",
+            running_mode=mp_vision.RunningMode.VIDEO,  # WebRTC streaming
+            max_poses=1,
+            min_pose_detection_confidence=0.3,         # un poco más laxo
+            # min_tracking_confidence (opcional; tu módulo lo soporta)
+            min_tracking_confidence=0.2,
+        )
+        pose_landmarker_video = PoseLandmarkerFactory(pose_cfg_video).create_with_fallback()
+        logger.info("PoseLandmarker (VIDEO) inicializado.")
+    else:
+        pose_landmarker_video = None
+        logger.info("POSE_USE_VIDEO=0 → WebRTC usará PoseLandmarker (IMAGE).")
 
     # ---- Face Landmarker (IMAGE) ----
     if face_lock is None:
@@ -168,6 +183,7 @@ async def _cleanup(app, loop):
     results_dc_by_pc.clear()
     ctrl_dc_by_pc.clear()
     need_keyframe_by_pc.clear()
+    results_seq_by_pc.clear()
     logger.info("RTCPeerConnections cerrados.")
 
 # ─────────────── Helpers ───────────────
@@ -291,19 +307,25 @@ def pack_pose_frame(image_w: int, image_h: int, poses: List[List[Tuple[int, int]
     return bytes(out)
 
 def pack_pose_frame_delta(
-    prev: list[list[tuple[int, int]]] | None,
-    curr: list[list[tuple[int, int]]],
+    prev: List[List[Tuple[int, int]]] | None,
+    curr: List[List[Tuple[int, int]]],
     image_w: int,
     image_h: int,
-    keyframe: bool
+    keyframe: bool,
+    *,
+    seq: Optional[int] = None,
+    ver: int = 1,  # v1 carries u16 seq after flags
 ) -> bytes:
     # If absolute body is needed, force the header flag too.
     absolute_needed = (prev is None) or (len(prev) != len(curr))
     keyframe = keyframe or absolute_needed
 
     out = bytearray(b"PD")
-    out += bytes([0])                      # ver
-    out += bytes([1 if keyframe else 0])   # flags
+    out += bytes([ver & 0xFF])               # ver
+    out += bytes([1 if keyframe else 0])     # flags
+    if ver >= 1:
+        out += struct.pack("<H", (seq or 0) & 0xFFFF)  # u16 seq
+
     out += bytes([len(curr)])
     out += struct.pack("<HH", image_w, image_h)
 
@@ -495,8 +517,14 @@ async def _consume_incoming_video(track: MediaStreamTrack, pc: RTCPeerConnection
     last_poses_px: List[List[Tuple[int,int]]] | None = None
     last_key_ms = 0
     last_sent_ms = 0
-    KEYFRAME_INTERVAL_MS = 600      # slightly more aggressive
-    MIN_SEND_MS = 66                # ~15 fps when healthy
+    last_change_ms = 0
+    last_abs_ms = 0
+    idle_start_ms: Optional[int] = None
+
+    # More aggressive refresh to heal loss/reorder and long stillness.
+    KEYFRAME_INTERVAL_MS = 300
+    NOCHANGE_KEYFRAME_AFTER_MS = 400
+    MIN_SEND_MS = 66  # ~15 fps when healthy
 
     # ── Congestion control ───────────────────────────────────────────────────
     SEND_THRESHOLD = 32_768
@@ -519,6 +547,11 @@ async def _consume_incoming_video(track: MediaStreamTrack, pc: RTCPeerConnection
             continue
 
         ts_ms = int(time.monotonic() * 1000)
+
+        # Input cadence diagnostics
+        if last_ts_input and (ts_ms - last_ts_input) > FRAME_GAP_WARN_MS:
+            logger.warning("Input frame gap: %d ms", ts_ms - last_ts_input)
+
         if ts_ms <= last_ts_input:
             ts_ms = last_ts_input + 1
         last_ts_input = ts_ms
@@ -570,21 +603,43 @@ async def _consume_incoming_video(track: MediaStreamTrack, pc: RTCPeerConnection
             else:
                 w, h, poses_px = _poses_px_from_result(result, img_bgr.shape)
 
+                changed = (poses_px != last_poses_px)
+                if changed or last_change_ms == 0:
+                    last_change_ms = ts_ms
+
+                # detect idle (no sends or no changes for a while)
+                if (ts_ms - last_sent_ms) > IDLE_TO_FORCE_KF_MS or \
+                   (ts_ms - last_change_ms) > IDLE_TO_FORCE_KF_MS:
+                    idle_start_ms = idle_start_ms or ts_ms
+                else:
+                    idle_start_ms = None
+
                 # Decide if a keyframe is needed
                 external_kf = bool(need_keyframe_by_pc.pop(pc, False))
-                force_key = (last_poses_px is None) or (len(last_poses_px) != len(poses_px))
-                gap_key = (ts_ms - last_sent_ms) > 250  # refresh sooner after gaps
-                need_key = external_kf or force_key or gap_key or ((ts_ms - last_key_ms) >= KEYFRAME_INTERVAL_MS)
+                force_key   = (last_poses_px is None) or (len(last_poses_px) != len(poses_px))
+                gap_key     = (ts_ms - last_sent_ms) > 250
+                stale_key   = (ts_ms - last_key_ms) >= KEYFRAME_INTERVAL_MS
+                nochange_kf = (ts_ms - last_change_ms) >= NOCHANGE_KEYFRAME_AFTER_MS
+                first_move_after_idle = changed and (idle_start_ms is not None)
+                heartbeat_abs = ABSOLUTE_INTERVAL_MS > 0 and (ts_ms - last_abs_ms) >= ABSOLUTE_INTERVAL_MS
+
+                need_key = external_kf or force_key or gap_key or stale_key or nochange_kf or first_move_after_idle or heartbeat_abs
+
+                # PD v1 with sequence (lets client detect loss/reorder)
+                seq = (results_seq_by_pc.get(pc, 0) + 1) & 0xFFFF
+                results_seq_by_pc[pc] = seq
 
                 if "pack_pose_frame_delta" in globals():
                     packet = globals()["pack_pose_frame_delta"](
-                        last_poses_px, poses_px, w, h, need_key
+                        last_poses_px, poses_px, w, h, need_key, seq=seq, ver=1
                     )
                     if need_key:
                         last_key_ms = ts_ms
+                        last_abs_ms = ts_ms
                 else:
                     packet = pack_pose_frame(w, h, poses_px)
                     last_key_ms = ts_ms  # 'PO' is absolute
+                    last_abs_ms = ts_ms
 
                 if getattr(dc, "bufferedAmount", 0) < SEND_THRESHOLD:
                     dc.send(packet)
@@ -628,6 +683,9 @@ async def webrtc_offer(request):
     except Exception:
         pass
 
+    # Init PD sequence for this PC
+    results_seq_by_pc[pc] = 0
+
     @pc.on("datachannel")
     def on_dc(channel):
         label = getattr(channel, "label", "")
@@ -658,6 +716,7 @@ async def webrtc_offer(request):
                 results_dc_by_pc.pop(pc, None)
                 ctrl_dc_by_pc.pop(pc, None)
                 need_keyframe_by_pc.pop(pc, None)
+                results_seq_by_pc.pop(pc, None)
 
     await pc.setRemoteDescription(offer)
     answer = await pc.createAnswer()

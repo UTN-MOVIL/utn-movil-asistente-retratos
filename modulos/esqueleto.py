@@ -38,6 +38,9 @@ class AppConfig:
     min_pose_detection_confidence: float = 0.5
     running_mode: vision.RunningMode = vision.RunningMode.VIDEO  # IMAGE | VIDEO | LIVE_STREAM
 
+    # NEW (optional): request more eager tracking when using RunningMode.VIDEO
+    min_tracking_confidence: Optional[float] = None  # ← added
+
 
 # ─────────────────────── Utilidades de modelo ───────────────────────
 
@@ -95,15 +98,24 @@ class LandmarkerFactory:
     def _create(self, use_gpu: bool):
         delegate = python.BaseOptions.Delegate.GPU if use_gpu else python.BaseOptions.Delegate.CPU
         base_opts = python.BaseOptions(model_asset_path=str(self.cfg.model_path), delegate=delegate)
-        opts = vision.PoseLandmarkerOptions(
+
+        # Build options with safe inclusion of min_tracking_confidence
+        kwargs = dict(
             base_options=base_opts,
             running_mode=self.cfg.running_mode,
             num_poses=self.cfg.max_poses,
             min_pose_detection_confidence=self.cfg.min_pose_detection_confidence,
-            # Optional extra thresholds if you want:
-            # min_pose_presence_confidence=0.5,
-            # min_tracking_confidence=0.5,
         )
+        if self.cfg.min_tracking_confidence is not None:
+            kwargs["min_tracking_confidence"] = self.cfg.min_tracking_confidence
+
+        try:
+            opts = vision.PoseLandmarkerOptions(**kwargs)
+        except TypeError:
+            # Installed MediaPipe version may not accept min_tracking_confidence
+            kwargs.pop("min_tracking_confidence", None)
+            opts = vision.PoseLandmarkerOptions(**kwargs)
+
         return vision.PoseLandmarker.create_from_options(opts)
 
     def create_with_fallback(self):
@@ -383,6 +395,7 @@ def build_cfg_from_args() -> AppConfig:
                    help="Preferencia de delegado TFLite (default: auto)")
     p.add_argument("--max-poses", type=int, default=1)
     p.add_argument("--min-conf", type=float, default=0.5, help="Min pose detection confidence")
+    p.add_argument("--min-track", type=float, default=None, help="(Opcional) Min tracking confidence")
     p.add_argument("--no-draw", action="store_true", help="No dibujar esqueleto")
     p.add_argument("--title", type=str, default="Pose Landmarker (GPU si disponible)")
 
@@ -400,6 +413,7 @@ def build_cfg_from_args() -> AppConfig:
         draw_landmarks=not args.no_draw,
         max_poses=args.max_poses,
         min_pose_detection_confidence=args.min_conf,
+        min_tracking_confidence=args.min_track,  # ← new
     )
 
 

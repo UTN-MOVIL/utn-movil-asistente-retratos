@@ -295,6 +295,7 @@ async def _process_face(img_bgr: np.ndarray, return_image: bool):
 
 # ─────────────── Binary packers ───────────────
 def pack_pose_frame(image_w: int, image_h: int, poses: List[List[Tuple[int, int]]]) -> bytes:
+    """Absolute pixels packet: 'PO' ver=0"""
     out = bytearray()
     out += b"PO"
     out += bytes([0])            # version
@@ -314,9 +315,19 @@ def pack_pose_frame_delta(
     keyframe: bool,
     *,
     seq: Optional[int] = None,
-    ver: int = 1,  # v1 carries u16 seq after flags
+    ver: int = 2,  # v2: variable-length mask; carries u16 seq after flags
 ) -> bytes:
-    # If absolute body is needed, force the header flag too.
+    """
+    "PD" ver=2:
+      u8 'P','D', u8 ver(=2), u8 flags, u16 seq, u8 nPoses, u16 imgW, u16 imgH,
+      for each pose:
+        u8 nPts,
+        ceil(nPts/8) bytes mask (LE),
+        (int8 dx, int8 dy) for each 1-bit in mask
+      If keyframe flag set, carry absolutes: same body as "PO" (nPts + pairs u16 x,y)
+    ver=1 (back-compat):
+      mask is fixed u64 (8 bytes) per pose.
+    """
     absolute_needed = (prev is None) or (len(prev) != len(curr))
     keyframe = keyframe or absolute_needed
 
@@ -337,13 +348,23 @@ def pack_pose_frame_delta(
         return bytes(out)
 
     for p, cpose in enumerate(curr):
-        out += bytes([len(cpose)])
+        npts = len(cpose)
+        out += bytes([npts])
+
+        # build bitmask
         pmask = 0
         for i, (x, y) in enumerate(cpose):
             px, py = prev[p][i]
             if x != px or y != py:
                 pmask |= (1 << i)
-        out += struct.pack("<Q", pmask)
+
+        if ver >= 2:
+            mask_bytes = (npts + 7) // 8
+            out += int(pmask).to_bytes(mask_bytes, "little", signed=False)
+        else:
+            out += struct.pack("<Q", pmask)  # ver==1 fixed 64-bit mask
+
+        # deltas
         for i, (x, y) in enumerate(cpose):
             if (pmask >> i) & 1:
                 dx = max(-127, min(127, x - prev[p][i][0]))
@@ -511,7 +532,7 @@ async def _consume_incoming_video(track: MediaStreamTrack, pc: RTCPeerConnection
     """Consumes client video, runs pose, and pushes results via DataChannel."""
     global pose_lock, pose_landmarker_video, pose_landmarker_image
 
-    subscribed = relay.subscribe(track)
+    subscribed = track
 
     # Delta & pacing state
     last_poses_px: List[List[Tuple[int,int]]] | None = None
@@ -569,6 +590,7 @@ async def _consume_incoming_video(track: MediaStreamTrack, pc: RTCPeerConnection
                 last_key_ms = 0
                 last_poses_px = None
                 need_keyframe_by_pc[pc] = True
+                continue  # Don't attempt to send this iteration after recycle
             continue
         else:
             congested_since_ms = None
@@ -586,7 +608,7 @@ async def _consume_incoming_video(track: MediaStreamTrack, pc: RTCPeerConnection
             rgb = frame.to_ndarray(format="rgb24")
             mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-            # FIX: derive image shape from the current frame (no img_bgr here)
+            # derive image shape from the current frame
             h, w = frame.height, frame.width
             img_shape = (h, w, 3)
 
@@ -598,13 +620,13 @@ async def _consume_incoming_video(track: MediaStreamTrack, pc: RTCPeerConnection
 
             # === Serialize & send (send once, only if room) ===
             if WEBRTC_JSON_RESULTS:
-                payload = _results_pose_to_json(result, img_shape)  # FIX: use img_shape
+                payload = _results_pose_to_json(result, img_shape)
                 payload["ts_ms"] = ts_ms
                 if getattr(dc, "bufferedAmount", 0) < SEND_THRESHOLD:
                     dc.send(json.dumps(payload))
                     last_sent_ms = ts_ms
             else:
-                w0, h0, poses_px = _poses_px_from_result(result, img_shape)  # FIX: use img_shape
+                w0, h0, poses_px = _poses_px_from_result(result, img_shape)
 
                 changed = (poses_px != last_poses_px)
                 if changed or last_change_ms == 0:
@@ -628,13 +650,13 @@ async def _consume_incoming_video(track: MediaStreamTrack, pc: RTCPeerConnection
 
                 need_key = external_kf or force_key or gap_key or stale_key or nochange_kf or first_move_after_idle or heartbeat_abs
 
-                # PD v1 with sequence (lets client detect loss/reorder)
+                # PD v2 with sequence (lets client detect loss/reorder) and compact mask
                 seq = (results_seq_by_pc.get(pc, 0) + 1) & 0xFFFF
                 results_seq_by_pc[pc] = seq
 
                 if "pack_pose_frame_delta" in globals():
                     packet = globals()["pack_pose_frame_delta"](
-                        last_poses_px, poses_px, w0, h0, need_key, seq=seq, ver=1
+                        last_poses_px, poses_px, w0, h0, need_key, seq=seq, ver=2
                     )
                     if need_key:
                         last_key_ms = ts_ms

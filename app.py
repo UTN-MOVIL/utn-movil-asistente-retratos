@@ -583,11 +583,14 @@ async def _consume_incoming_video(track: MediaStreamTrack, pc: RTCPeerConnection
 
         try:
             # === Inference ===
-            async with pose_lock:
-                img_bgr = frame.to_ndarray(format="bgr24")
-                rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-                mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            rgb = frame.to_ndarray(format="rgb24")
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
+            # FIX: derive image shape from the current frame (no img_bgr here)
+            h, w = frame.height, frame.width
+            img_shape = (h, w, 3)
+
+            async with pose_lock:
                 if pose_landmarker_video is not None:
                     result = pose_landmarker_video.detect_for_video(mp_image, ts_ms)
                 else:
@@ -595,13 +598,13 @@ async def _consume_incoming_video(track: MediaStreamTrack, pc: RTCPeerConnection
 
             # === Serialize & send (send once, only if room) ===
             if WEBRTC_JSON_RESULTS:
-                payload = _results_pose_to_json(result, img_bgr.shape)
+                payload = _results_pose_to_json(result, img_shape)  # FIX: use img_shape
                 payload["ts_ms"] = ts_ms
                 if getattr(dc, "bufferedAmount", 0) < SEND_THRESHOLD:
                     dc.send(json.dumps(payload))
                     last_sent_ms = ts_ms
             else:
-                w, h, poses_px = _poses_px_from_result(result, img_bgr.shape)
+                w0, h0, poses_px = _poses_px_from_result(result, img_shape)  # FIX: use img_shape
 
                 changed = (poses_px != last_poses_px)
                 if changed or last_change_ms == 0:
@@ -631,13 +634,13 @@ async def _consume_incoming_video(track: MediaStreamTrack, pc: RTCPeerConnection
 
                 if "pack_pose_frame_delta" in globals():
                     packet = globals()["pack_pose_frame_delta"](
-                        last_poses_px, poses_px, w, h, need_key, seq=seq, ver=1
+                        last_poses_px, poses_px, w0, h0, need_key, seq=seq, ver=1
                     )
                     if need_key:
                         last_key_ms = ts_ms
                         last_abs_ms = ts_ms
                 else:
-                    packet = pack_pose_frame(w, h, poses_px)
+                    packet = pack_pose_frame(w0, h0, poses_px)
                     last_key_ms = ts_ms  # 'PO' is absolute
                     last_abs_ms = ts_ms
 
@@ -739,7 +742,7 @@ async def http_handler(request):
 @app.route("/", methods=["GET"])
 async def root_handler(request):
     return response.text(
-        "Servidor Sanic OK. Prueba /ws, /http, /pose, /face, /ws/pose, /ws/face o /webrtc/offer (POST signaling)."
+        "Servidor Sanic OK. Prueba /ws, /http, /ws/pose, /ws/face o /webrtc/offer (POST signaling)."
     )
 
 if __name__ == "__main__":

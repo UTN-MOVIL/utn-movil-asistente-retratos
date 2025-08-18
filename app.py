@@ -35,7 +35,7 @@ from modulos.puntos_faciales import (
 )
 
 # ─────────────── WebRTC en módulo aparte ───────────────
-from webrtc_module import build_webrtc_blueprint  # <— NUEVO
+from connection.webrtc import build_webrtc_blueprint  # <— NUEVO
 
 app = Sanic("MiAppHttpWebSocket")
 
@@ -280,7 +280,6 @@ webrtc_bp = build_webrtc_blueprint(
     make_mp_image=_make_mp_image,
     detect_image=_detect_pose_image,
     detect_video=_detect_pose_video,
-    results_to_json=_results_pose_to_json,
     poses_px_from_result=_poses_px_from_result,
     url_prefix="",  # deja /webrtc/offer
 )

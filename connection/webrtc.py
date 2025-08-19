@@ -403,7 +403,7 @@ class GSTWebRTCSession:
         self.webrtc = Gst.ElementFactory.make("webrtcbin", "webrtcbin")
         assert self.webrtc is not None, "webrtcbin plugin not available"
 
-        self.webrtc.set_property("latency", 0) 
+        self.webrtc.set_property("latency", 0)
 
         # STUN/TURN
         self.webrtc.set_property("stun-server", _fmt_stun(STUN_URL))
@@ -743,16 +743,20 @@ class GSTWebRTCSession:
 
     # ───── Incoming media handling ─────
     def _on_incoming_pad(self, webrtc, pad: Gst.Pad):
+        # Be defensive about caps.
         caps = pad.get_current_caps() or pad.query_caps(None)
+        if not caps or caps.get_size() == 0:
+            self._warn("Incoming pad without caps; ignoring")
+            return
         s = caps.get_structure(0)
         if s.get_name() != "application/x-rtp":
             return
-        media = s.get_string("media")
+        media = (s.get_string("media") or "").lower()
         enc = (s.get_string("encoding-name") or "").upper()
         if media != "video":
             return
 
-        self._info(f"Incoming RTP video pad; encoding={enc}")
+        self._info(f"Incoming RTP video pad; encoding={enc} pad={pad.get_name()}")
 
         # (Optional) quickly count incoming RTP buffers
         try:
@@ -768,11 +772,82 @@ class GSTWebRTCSession:
         except Exception as e:
             self._warn(f"Couldn't add RTP pad probe: {e}")
 
-        # Offload building/linking of the decode chain:
+        # Helper to fall back to the original direct attach
+        def _fallback_direct_attach():
+            self._warn("Falling back to direct attach (no jbuf/queue)")
+            try:
+                attach_rtp_video_decode_chain(
+                    pipeline=self.pipeline,
+                    src_pad=pad,
+                    encoding_name=enc,
+                    on_new_sample=self._on_new_sample,
+                    dbg=print,
+                    warn=self._warn,
+                )
+                self._info("Appsink wired (fallback); waiting for decoded RGB frames…")
+                if not self.process_task:
+                    self.loop.call_soon_threadsafe(self._start_processing_task)
+            except Exception as e:
+                self._warn(f"attach decode chain (fallback) failed: {e}")
+
+        # Build ultra-low-latency chain: rtpjitterbuffer → leaky queue → decode
         try:
+            jbuf = Gst.ElementFactory.make("rtpjitterbuffer", None)
+            q    = Gst.ElementFactory.make("queue", None)
+            if not jbuf or not q:
+                raise RuntimeError("Failed to create rtpjitterbuffer/queue")
+
+            # Configure for low latency
+            jbuf.set_property("latency", 0)
+            jbuf.set_property("drop-on-late", True)
+            jbuf.set_property("do-lost", True)
+
+            q.set_property("leaky", 2)  # downstream
+            q.set_property("max-size-buffers", 1)
+            q.set_property("max-size-time", 0)
+            q.set_property("max-size-bytes", 0)
+
+            # Add to pipeline and sync states (pipeline is already PLAYING)
+            self.pipeline.add(jbuf)
+            self.pipeline.add(q)
+            if not jbuf.sync_state_with_parent():
+                self._warn("jitterbuffer failed to sync state with parent")
+            if not q.sync_state_with_parent():
+                self._warn("queue failed to sync state with parent")
+
+            # Link: webrtcbin RTP src pad → jbuf → queue
+            linkret = pad.link(jbuf.get_static_pad("sink"))
+            if linkret != Gst.PadLinkReturn.OK:
+                # Clean up and fallback
+                self._warn(f"Link webrtcbin:src → rtpjitterbuffer:sink failed: {linkret.value_nick}")
+                try:
+                    self.pipeline.remove(jbuf)
+                    self.pipeline.remove(q)
+                except Exception:
+                    pass
+                _fallback_direct_attach()
+                return
+
+            if not jbuf.link(q):
+                self._warn("Link rtpjitterbuffer → queue failed")
+                try:
+                    pad.unlink(jbuf.get_static_pad("sink"))
+                except Exception:
+                    pass
+                try:
+                    self.pipeline.remove(jbuf)
+                    self.pipeline.remove(q)
+                except Exception:
+                    pass
+                _fallback_direct_attach()
+                return
+
+            self._dbg("Inserted rtpjitterbuffer + leaky queue before decode chain (links OK)")
+
+            # Feed the decode chain from the queue's SRC pad
             attach_rtp_video_decode_chain(
                 pipeline=self.pipeline,
-                src_pad=pad,
+                src_pad=q.get_static_pad("src"),  # ← feed from the queue now
                 encoding_name=enc,
                 on_new_sample=self._on_new_sample,
                 dbg=print,
@@ -783,7 +858,8 @@ class GSTWebRTCSession:
             if not self.process_task:
                 self.loop.call_soon_threadsafe(self._start_processing_task)
         except Exception as e:
-            self._warn(f"Failed to attach decode chain: {e}")
+            self._warn(f"Failed to attach decode chain via jbuf/queue: {e}")
+            _fallback_direct_attach()
 
     # appsink callback (GStreamer thread) — copy frame & enqueue via loop.call_soon_threadsafe
     def _on_new_sample(self, sink: GstApp.AppSink):

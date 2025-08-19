@@ -926,7 +926,7 @@ class GSTWebRTCSession:
     async def _process_frames(self):
         SEND_THRESHOLD = 32_768
         RECYCLE_AFTER_MS = 300
-        MIN_SEND_MS = 66  # ~15 fps
+        MIN_SEND_MS = 33  # ~30 fps
 
         congested_since_ms: Optional[int] = None
 

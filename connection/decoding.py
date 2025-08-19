@@ -115,6 +115,58 @@ def _log_decoder_hw_details(dec: Gst.Element, enc: str, dbg: Callable[[str], Non
         dbg(" ".join(msg))
 
 
+# ──────────────────────── Low-latency decoder tweaks ───────────────────────
+
+def _apply_decoder_latency_tweaks(dec: Gst.Element, dbg: Callable[[str], None] | None = None) -> None:
+    """Best-effort low-latency settings depending on the decoder in use.
+    - NVDEC (nvh264dec/nvh265dec): disable-dpb=true
+    - Jetson (nvv4l2decoder):      low-latency=true
+    - FFmpeg (avdec_*):            thread-type=slice and threads=2..4
+    Applies only if the property exists on the element (safe/no-op otherwise)."""
+    if not dec:
+        return
+
+    # Helper: set a property if supported (avoid noisy warnings)
+    def _set_prop(name: str, value) -> bool:
+        with contextlib.suppress(Exception):
+            # Some builds expose hyphen or underscore variants; try both.
+            for candidate in (name, name.replace('-', '_')):
+                if hasattr(dec, 'find_property') and dec.find_property(candidate):
+                    dec.set_property(candidate, value)
+                    if dbg:
+                        try:
+                            factory = dec.get_factory().get_name()
+                        except Exception:
+                            factory = 'unknown'
+                        dbg(f"Decoder tweak: {factory}.{candidate}={value}")
+                    return True
+        return False
+
+    try:
+        factory = dec.get_factory().get_name().lower() if dec.get_factory() else ''
+    except Exception:
+        factory = ''
+
+    # NVDEC (discrete NVIDIA via nvcodec)
+    if factory in ("nvh264dec", "nvh265dec"):
+        _set_prop("disable-dpb", True)
+
+    # Jetson V4L2 decoder
+    if factory == "nvv4l2decoder":
+        _set_prop("low-latency", True)
+
+    # FFmpeg software decoders (avdec_*)
+    if factory.startswith("avdec_"):
+        # Prefer slice threading to reduce per-frame latency
+        ok = _set_prop("thread-type", "slice")
+        if not ok:
+            # Some older builds may accept ints; slice is typically 1
+            _set_prop("thread-type", 1)
+        # Cap thread count between 2 and 4
+        threads = max(2, min(4, (os.cpu_count() or 2)))
+        _set_prop("threads", threads)
+
+
 def _make_depay_and_parse(encoding: str) -> Tuple[Optional[Gst.Element], Optional[Gst.Element]]:
     enc = (encoding or "").upper()
     depay = parse = None
@@ -169,6 +221,8 @@ def _make_decoder_for(
     elif "AV1" in enc:
         dec = (Gst.ElementFactory.make("av1dec", None)
                or Gst.ElementFactory.make("dav1dec", None))
+    if dec:
+        _apply_decoder_latency_tweaks(dec, dbg)
     if dbg and dec:
         _log_decoder_hw_details(dec, enc, dbg)
     if warn and not dec:

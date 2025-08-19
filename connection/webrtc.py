@@ -403,6 +403,8 @@ class GSTWebRTCSession:
         self.webrtc = Gst.ElementFactory.make("webrtcbin", "webrtcbin")
         assert self.webrtc is not None, "webrtcbin plugin not available"
 
+        self.webrtc.set_property("latency", 0) 
+
         # STUN/TURN
         self.webrtc.set_property("stun-server", _fmt_stun(STUN_URL))
         turl = _fmt_turn(TURN_URL, TURN_USER, TURN_PASS)

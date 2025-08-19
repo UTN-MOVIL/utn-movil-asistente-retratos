@@ -256,10 +256,21 @@ def build_rtp_video_decode_bin(
     postproc, caps_to_sys = _maybe_postproc_after(dec, dbg=dbg)
 
     swcvt = Gst.ElementFactory.make("videoconvert", "swcvt")  # ensures CPU colorspace
+    # Enable QoS on the CPU converter (optional but recommended)
+    with contextlib.suppress(Exception):
+        swcvt.set_property("qos", True)
+
     caps_rgb = None
     if want_rgb:
         caps_rgb = Gst.ElementFactory.make("capsfilter", "caps_rgb")
         caps_rgb.set_property("caps", Gst.Caps.from_string("video/x-raw,format=RGB"))
+
+    # Create the leaky queue right before appsink
+    q2 = Gst.ElementFactory.make("queue", "leaky_to_sink")
+    q2.set_property("leaky", 2)               # downstream leaky
+    q2.set_property("max-size-buffers", 1)
+    q2.set_property("max-size-time", 0)
+    q2.set_property("max-size-bytes", 0)
 
     appsink: GstApp.AppSink = Gst.ElementFactory.make("appsink", "appsink")
     appsink.set_property("emit-signals", True)
@@ -268,6 +279,7 @@ def build_rtp_video_decode_bin(
     appsink.set_property("drop", True)
     appsink.connect("new-sample", on_new_sample)
 
+    # Build the chain, inserting q2 just before appsink
     chain = [q_in, depay]
     if parse:
         chain.append(parse)
@@ -280,6 +292,7 @@ def build_rtp_video_decode_bin(
         chain.append(swcvt)
     if caps_rgb:
         chain.append(caps_rgb)
+    chain.append(q2)
     chain.append(appsink)
 
     for e in chain:

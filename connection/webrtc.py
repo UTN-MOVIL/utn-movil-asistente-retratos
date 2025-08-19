@@ -1,5 +1,7 @@
-# connection/webrtc.py — GStreamer (webrtcbin) version (binary-only PO/PD) — WITH PRINT LOGS + DIAGNOSTICS
-# Thread-safety fixes for asyncio <-> GLib (uvloop), safe SDP parsing, and appsink->asyncio queue handoff.
+# connection/webrtc.py — GStreamer (webrtcbin) version (binary-only PO/PD)
+# WITH PRINT LOGS + DIAGNOSTICS — negotiated datachannels (skip DCEP)
+# Thread-safety fixes for asyncio <-> GLib (uvloop), safe SDP parsing,
+# and appsink->asyncio queue handoff.
 
 from __future__ import annotations
 
@@ -25,7 +27,7 @@ gi.require_version("GstApp", "1.0")
 from gi.repository import Gst, GstWebRTC, GstSdp, GstApp, GLib, GObject
 
 from .robust_bytes import _as_bytes
-from .decoding import attach_rtp_video_decode_chain  # ← NEW
+from .decoding import attach_rtp_video_decode_chain  # ← keeps decode chain separate
 
 Gst.init(None)
 
@@ -71,6 +73,11 @@ TURN_USER = os.getenv("TURN_USERNAME")
 TURN_PASS = os.getenv("TURN_PASSWORD")
 
 AV1_SELFTEST_FILE = os.getenv("AV1_SELFTEST_FILE")  # optional file to decode at startup
+
+# NEW: force negotiated (pre-created) data channels to skip DCEP
+NEGOTIATED_DCS        = os.getenv("NEGOTIATED_DCS", "1") == "1"
+DC_RESULTS_ID         = int(os.getenv("DC_RESULTS_ID", "0"))
+DC_CTRL_ID            = int(os.getenv("DC_CTRL_ID", "1"))
 
 # ─────────────── Estado global ───────────────
 _sessions: Set["GSTWebRTCSession"] = set()
@@ -283,8 +290,9 @@ class GSTWebRTCSession:
         self._ack_warned: Set[int] = set()
         self.last_ack_seq: Optional[int] = None
 
-        # CREATE the future on the provided loop (not the GLib thread)
+        # CREATE the futures on the provided loop (not the GLib thread)
         self._gathering_done = self.loop.create_future()
+        self._local_answer_set = self.loop.create_future()  # NEW: to wait for set-local-description
 
         # Stats
         self.sid = f"{id(self) & 0xFFFFFF:06x}"
@@ -295,7 +303,7 @@ class GSTWebRTCSession:
             delta_sent=0,
             bytes_sent=0,
             drops_due_buffer=0,
-            dc_recycles=0,
+            dc_recycles=0,  # maintained for backward compat; no actual recycle on negotiated
             infer_ms_last=0.0,
             infer_ms_avg=0.0,
             acks=0,
@@ -328,6 +336,10 @@ class GSTWebRTCSession:
     def _mark_gathering_done(self):
         if not self._gathering_done.done():
             self._gathering_done.set_result(True)
+
+    def _mark_local_answer_set(self):  # NEW helper
+        if not self._local_answer_set.done():
+            self._local_answer_set.set_result(True)
 
     def _start_processing_task(self):
         if not self.process_task or self.process_task.done():
@@ -415,7 +427,46 @@ class GSTWebRTCSession:
         bus.add_signal_watch()
         bus.connect("message", self._on_bus_message)
 
+        # IMPORTANT: Do NOT pre-create negotiated DCs here anymore.
+        # We'll create them *after* set-remote-description and *before* create-answer.
+        if NEGOTIATED_DCS:
+            self._info("Negotiated DCs will be created after SRD (skip DCEP)")
+        else:
+            self._info("NEGOTIATED_DCS=0 → will rely on remote-announced (DCEP) channels")
+
         self._info("Pipeline constructed")
+
+    # Create negotiated channels (id=0 results, id=1 ctrl). Call only after SRD.
+    def _precreate_negotiated_dcs(self):
+        if not self.webrtc:
+            return
+        if self.results_dc or self.ctrl_dc:
+            # Already created
+            return
+        try:
+            # results: unordered + lossy, negotiated id
+            opts_res = Gst.Structure.new_empty("application/webrtc-data-channel")
+            opts_res.set_value("ordered", False)
+            opts_res.set_value("max-retransmits", 0)
+            opts_res.set_value("negotiated", True)
+            opts_res.set_value("id", DC_RESULTS_ID)
+            self.results_dc = self.webrtc.emit("create-data-channel", "results", opts_res)
+            self._wire_results_dc(self.results_dc)
+            self._info(f"Created negotiated DC 'results' id={DC_RESULTS_ID} (unordered, maxRetransmits=0)")
+        except Exception as e:
+            self._warn(f"Failed to create negotiated 'results' datachannel: {e}")
+
+        try:
+            # ctrl: reliable, negotiated id
+            opts_ctrl = Gst.Structure.new_empty("application/webrtc-data-channel")
+            opts_ctrl.set_value("ordered", True)  # reliable default
+            opts_ctrl.set_value("negotiated", True)
+            opts_ctrl.set_value("id", DC_CTRL_ID)
+            self.ctrl_dc = self.webrtc.emit("create-data-channel", "ctrl", opts_ctrl)
+            self._wire_ctrl_dc(self.ctrl_dc)
+            self._info(f"Created negotiated DC 'ctrl' id={DC_CTRL_ID} (reliable)")
+        except Exception as e:
+            self._warn(f"Failed to create negotiated 'ctrl' datachannel: {e}")
 
     def _on_bus_message(self, bus: Gst.Bus, msg: Gst.Message):
         try:
@@ -468,45 +519,6 @@ class GSTWebRTCSession:
         self.ctrl_dc = None
         self._info("Session stopped")
 
-    # ───── Helpers: (re)create DataChannels safely ─────
-    def _maybe_create_data_channels(self):
-        """Create results/ctrl data channels only if the PC isn't closed/failed."""
-        if not self.webrtc:
-            return
-        state = self.webrtc.get_property("connection-state")
-        if state in (
-            GstWebRTC.WebRTCPeerConnectionState.CLOSED,
-            GstWebRTC.WebRTCPeerConnectionState.FAILED,
-        ):
-            return
-
-        # results: unordered + lossy
-        if not self.results_dc or self.results_dc.get_property("ready-state") in (
-            GstWebRTC.WebRTCDataChannelState.CLOSING,
-            GstWebRTC.WebRTCDataChannelState.CLOSED,
-        ):
-            try:
-                opts_res = Gst.Structure.new_empty("application/webrtc-data-channel")
-                opts_res.set_value("ordered", False)
-                opts_res.set_value("max-retransmits", 0)
-                self.results_dc = self.webrtc.emit("create-data-channel", "results", opts_res)
-                self._wire_results_dc(self.results_dc)
-                self._info("Created datachannel 'results' (unordered, maxRetransmits=0)")
-            except Exception as e:
-                self._warn(f"Failed to create 'results' datachannel: {e}")
-
-        # ctrl: reliable (default ordered)
-        if not self.ctrl_dc or self.ctrl_dc.get_property("ready-state") in (
-            GstWebRTC.WebRTCDataChannelState.CLOSING,
-            GstWebRTC.WebRTCDataChannelState.CLOSED,
-        ):
-            try:
-                self.ctrl_dc = self.webrtc.emit("create-data-channel", "ctrl", None)
-                self._wire_ctrl_dc(self.ctrl_dc)
-                self._info("Created datachannel 'ctrl' (reliable)")
-            except Exception as e:
-                self._warn(f"Failed to create 'ctrl' datachannel: {e}")
-
     # ───── Signaling (HTTP) helpers ─────
     async def accept_offer_and_create_answer(self, offer_sdp_text: str) -> str:
         assert self.webrtc is not None
@@ -523,26 +535,44 @@ class GSTWebRTCSession:
             GstWebRTC.WebRTCSDPType.OFFER, sdpmsg
         )
 
-        # 1) set-remote-description
-        p = Gst.Promise.new()
-        self.webrtc.emit("set-remote-description", offer, p)
-        p.interrupt()
-
-        # 3) create-answer (unchanged)
-        def on_answer_created(promise, webrtc, _userdata):
+        # 1) set-remote-description, and only after SRD create negotiated DCs, then create-answer
+        def _on_answer_created(promise, webrtc, self_ref: "GSTWebRTCSession"):
             try:
                 reply = promise.get_reply()
                 answer = reply.get_value("answer")
                 p2 = Gst.Promise.new()
                 webrtc.emit("set-local-description", answer, p2)
                 p2.interrupt()
-                self._info("Local SDP answer set")
+                self_ref._info("Local SDP answer set")
+                try:
+                    # mark from GLib thread
+                    self_ref.loop.call_soon_threadsafe(self_ref._mark_local_answer_set)
+                except Exception:
+                    pass
             except Exception as e:
-                self._warn(f"create-answer/set-local failed: {e!r}")
-                self._buslog("ERROR", "webrtcbin", f"create-answer/set-local failed: {e!r}")
+                self_ref._warn(f"create-answer/set-local failed: {e!r}")
+                self_ref._buslog("ERROR", "webrtcbin", f"create-answer/set-local failed: {e!r}")
 
-        prom = Gst.Promise.new_with_change_func(on_answer_created, self.webrtc, None)
-        self.webrtc.emit("create-answer", None, prom)
+        def _on_srd_applied(promise, webrtc, self_ref: "GSTWebRTCSession"):
+            try:
+                if NEGOTIATED_DCS:
+                    self_ref._precreate_negotiated_dcs()
+                else:
+                    self_ref._info("NEGOTIATED_DCS=0 → will rely on remote-announced (DCEP) channels")
+            except Exception as e:
+                self_ref._warn(f"Creating negotiated DCs after SRD failed: {e}")
+            # Now generate the answer
+            prom2 = Gst.Promise.new_with_change_func(_on_answer_created, webrtc, self_ref)
+            webrtc.emit("create-answer", None, prom2)
+
+        prom_srd = Gst.Promise.new_with_change_func(_on_srd_applied, self.webrtc, self)
+        self.webrtc.emit("set-remote-description", offer, prom_srd)
+
+        # 2) Wait for local answer to be set (briefly), then ICE gathering (up to 5s)
+        try:
+            await asyncio.wait_for(self._local_answer_set, timeout=3.0)
+        except asyncio.TimeoutError:
+            self._warn("Timeout waiting for local answer; continuing anyway")
 
         # Wait for ICE gathering, but with a timeout — then return whatever we have.
         try:
@@ -554,7 +584,6 @@ class GSTWebRTCSession:
         # Get local description
         local: GstWebRTC.WebRTCSessionDescription = self.webrtc.get_property("local-description")
         if not local:
-            # Help the caller: bubble more context
             raise RuntimeError("local-description is None after create-answer; see bus_tail")
         return local.sdp.as_text()
 
@@ -669,6 +698,7 @@ class GSTWebRTCSession:
         dc.connect("on-message-data", _on_msg_bin)
 
     def _on_data_channel(self, webrtc, channel: GstWebRTC.WebRTCDataChannel):
+        # For DCEP-created channels (NEGOTIATED_DCS=0). Negotiated channels we create locally.
         label = channel.props.label or ""
         self._dbg(f"on-data-channel: '{label}' readyState={channel.get_property('ready-state')}")
         if label == "results":
@@ -855,14 +885,10 @@ class GSTWebRTCSession:
             buf_amt = dc.get_property("buffered-amount") or 0
 
             if buf_amt >= SEND_THRESHOLD:
+                # For negotiated channels, don't try to recreate with the same id.
                 congested_since_ms = congested_since_ms or ts_ms
                 if (ts_ms - (congested_since_ms or ts_ms)) >= RECYCLE_AFTER_MS:
-                    try:
-                        self._info("Results DC congested; recycling channel and forcing next send as keyframe")
-                        self._maybe_create_data_channels()
-                        self.stats["dc_recycles"] = int(self.stats["dc_recycles"]) + 1
-                    except Exception as e:
-                        self._warn(f"DC recycle failed: {e}")
+                    self._info("Results DC congested; will skip frames and force next send as keyframe (no DC recycle for negotiated)")
                     congested_since_ms = None
                     self.last_key_ms = 0
                     self.last_poses_px = None

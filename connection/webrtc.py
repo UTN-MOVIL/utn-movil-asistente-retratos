@@ -862,6 +862,15 @@ class GSTWebRTCSession:
             jbuf.set_property("drop-on-late", True)
             jbuf.set_property("do-lost", True)
 
+            # NEW ↓
+            # Do not wait for retransmissions; keep minimal reordering window.
+            if jbuf.find_property("do-retransmission"):
+                jbuf.set_property("do-retransmission", False)
+            if jbuf.find_property("max-reorder"):          # packets
+                jbuf.set_property("max-reorder", 8)        # small but safe
+            if jbuf.find_property("max-dropout-time"):     # ms
+                jbuf.set_property("max-dropout-time", 50)  # don’t wait long on timestamp jumps
+
             q.set_property("leaky", 2)  # downstream
             q.set_property("max-size-buffers", 1)
             q.set_property("max-size-time", 0)

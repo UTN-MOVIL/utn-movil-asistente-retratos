@@ -31,18 +31,75 @@ from .decoding import attach_rtp_video_decode_chain  # ← keeps decode chain se
 
 Gst.init(None)
 
+# ─────────────── Global logging switch ───────────────
+# When True → log everything via print; when False → absolutely no console output.
+PRINT_LOGS = os.getenv("PRINT_LOGS", "0") == "1"
+
+def _noop(*_args, **_kwargs):
+    return None
+
+def _log_print(*args, **kwargs):
+    if PRINT_LOGS:
+        print(*args, **kwargs)
+
+# ─────────────── Hard mute of external loggers when PRINT_LOGS=0 ───────────────
+if not PRINT_LOGS:
+    import logging, warnings, sys
+    # 1) Disable stdlib logging everywhere
+    logging.disable(logging.CRITICAL)
+    for name in (
+        "asyncio", "sanic.root", "sanic.error", "sanic.access", "sanic.server",
+        "uvicorn", "gunicorn", "uvloop", "aiohttp",
+    ):
+        try:
+            logging.getLogger(name).disabled = True
+            logging.getLogger(name).setLevel(logging.CRITICAL)
+        except Exception:
+            pass
+    # 2) Hide warnings
+    warnings.filterwarnings("ignore")
+    # 3) Ensure asyncio debug/slow-callback logs are OFF
+    try:
+        os.environ.pop("PYTHONASYNCIODEBUG", None)
+    except Exception:
+        pass
+    try:
+        _loop = asyncio.get_event_loop()
+        _loop.set_debug(False)
+        if hasattr(_loop, "slow_callback_duration"):
+            try:
+                _loop.slow_callback_duration = float("inf")
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # 4) GStreamer/GLib quiet
+    try:
+        Gst.debug_set_active(False)
+        Gst.debug_set_threshold_from_string("0", True)
+    except Exception:
+        pass
+    # 5) Optional nuclear option: also redirect stdout/stderr to /dev/null when HARD_MUTE_STDIO=1
+    if os.getenv("HARD_MUTE_STDIO", "0") == "1":
+        try:
+            devnull = open(os.devnull, "w")
+            sys.stdout = devnull
+            sys.stderr = devnull
+        except Exception:
+            pass
+
 # ─────────────── Small logging helpers (print-only) ───────────────
 def _ts():
     return time.strftime("%H:%M:%S")
 
 def _ginfo(msg: str):
-    print(f"Srv 0 {_ts()} INFO:   {msg}", flush=True)
+    _log_print(f"Srv 0 {_ts()} INFO:   {msg}", flush=True)
 
 def _gwarn(msg: str):
-    print(f"Srv 0 {_ts()} WARN:   {msg}", flush=True)
+    _log_print(f"Srv 0 {_ts()} WARN:   {msg}", flush=True)
 
 def _gdebug(msg: str):
-    print(f"Srv 0 {_ts()} DEBUG:  {msg}", flush=True)
+    _log_print(f"Srv 0 {_ts()} DEBUG:  {msg}", flush=True)
 
 def _exc_str(e: BaseException) -> str:
     """repr + traceback for returning in JSON and printing."""
@@ -323,11 +380,14 @@ class GSTWebRTCSession:
 
     # ─────────────── session-scope print helpers ───────────────
     def _info(self, msg: str):
-        print(f"Srv 0 {_ts()} INFO:   [WebRTC {self.sid}] {msg}", flush=True)
+        if PRINT_LOGS:
+            _log_print(f"Srv 0 {_ts()} INFO:   [WebRTC {self.sid}] {msg}", flush=True)
     def _warn(self, msg: str):
-        print(f"Srv 0 {_ts()} WARN:   [WebRTC {self.sid}] {msg}", flush=True)
+        if PRINT_LOGS:
+            _log_print(f"Srv 0 {_ts()} WARN:   [WebRTC {self.sid}] {msg}", flush=True)
     def _dbg(self, msg: str):
-        print(f"Srv 0 {_ts()} DEBUG:  [WebRTC {self.sid}] {msg}", flush=True)
+        if PRINT_LOGS:
+            _log_print(f"Srv 0 {_ts()} DEBUG:  [WebRTC {self.sid}] {msg}", flush=True)
 
     def _buslog(self, level: str, src: str, text: str):
         line = f"{level} [{src}] {text}"
@@ -781,7 +841,7 @@ class GSTWebRTCSession:
                     src_pad=pad,
                     encoding_name=enc,
                     on_new_sample=self._on_new_sample,
-                    dbg=print,
+                    dbg=(self._dbg if PRINT_LOGS else _noop),
                     warn=self._warn,
                 )
                 self._info("Appsink wired (fallback); waiting for decoded RGB frames…")
@@ -850,7 +910,7 @@ class GSTWebRTCSession:
                 src_pad=q.get_static_pad("src"),  # ← feed from the queue now
                 encoding_name=enc,
                 on_new_sample=self._on_new_sample,
-                dbg=print,
+                dbg=(self._dbg if PRINT_LOGS else _noop),
                 warn=self._warn,
             )
             self._info("Appsink wired; waiting for decoded RGB frames…")
@@ -1166,6 +1226,30 @@ def build_webrtc_blueprint(
     _ensure_gst_mainloop()
 
     bp = Blueprint("webrtc", url_prefix=url_prefix)
+
+    # Ensure the running loop is also non-debug in Sanic context when PRINT_LOGS=0
+    if not PRINT_LOGS:
+        try:
+            loop = asyncio.get_event_loop()
+            loop.set_debug(False)
+            if hasattr(loop, "slow_callback_duration"):
+                try:
+                    loop.slow_callback_duration = float("inf")
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    @bp.listener("before_server_start")
+    async def _mute_sanic_logs(app, loop):
+        if not PRINT_LOGS:
+            import logging
+            for name in ("sanic.root", "sanic.error", "sanic.access", "sanic.server"):
+                try:
+                    logging.getLogger(name).disabled = True
+                    logging.getLogger(name).setLevel(logging.CRITICAL)
+                except Exception:
+                    pass
 
     @bp.get("/webrtc/av1/selftest")
     async def av1_selftest(request):

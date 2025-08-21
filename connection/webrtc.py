@@ -135,6 +135,8 @@ AV1_SELFTEST_FILE = os.getenv("AV1_SELFTEST_FILE")  # optional file to decode at
 NEGOTIATED_DCS        = os.getenv("NEGOTIATED_DCS", "1") == "1"
 DC_RESULTS_ID         = int(os.getenv("DC_RESULTS_ID", "0"))
 DC_CTRL_ID            = int(os.getenv("DC_CTRL_ID", "1"))
+SEND_GREETING = os.getenv("SEND_GREETING", "0") == "1"
+
 
 # NEW: optional ICE wait time (0 = don't wait, return answer immediately)
 WAIT_FOR_ICE_MS       = int(os.getenv("WAIT_FOR_ICE_MS", "0"))  # 0 = don't wait
@@ -659,17 +661,18 @@ class GSTWebRTCSession:
             return
         def on_open(ch):
             self._info("DataChannel 'results' open")
-            try:
-                ch.emit("send-string", "HELLO_FROM_SERVER")
-            except Exception as e:
-                self._warn(f"send-string hello failed: {e}")
-            try:
-                pkt = b"PO" + bytes([0, 0]) + struct.pack("<HH", 1, 1)
-                gbytes = GLib.Bytes(pkt)
-                ch.emit("send-data", gbytes)
-                self._dbg("Sent dummy PO packet on 'results' (1x1, 0 poses)")
-            except Exception as e:
-                self._warn(f"send-data dummy failed: {e}")
+            if SEND_GREETING:
+                try:
+                    ch.emit("send-string", "HELLO_FROM_SERVER")
+                except Exception as e:
+                    self._warn(f"send-string hello failed: {e}")
+                try:
+                    pkt = b"PO" + bytes([0, 0]) + struct.pack("<HH", 1, 1)
+                    gbytes = GLib.Bytes(pkt)
+                    ch.emit("send-data", gbytes)
+                    self._dbg("Sent dummy PO packet on 'results' (1x1, 0 poses)")
+                except Exception as e:
+                    self._warn(f"send-data dummy failed: {e}")
 
         def on_close(ch):
             self._warn("DataChannel 'results' closed")

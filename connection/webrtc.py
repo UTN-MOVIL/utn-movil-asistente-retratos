@@ -332,7 +332,7 @@ class GSTWebRTCSession:
         self.ctrl_dc: Optional[GstWebRTC.WebRTCDataChannel] = None
 
         # Create asyncio primitives on the right loop/thread
-        self.frame_q: asyncio.Queue = asyncio.Queue(maxsize=2)
+        self.frame_q: asyncio.Queue = asyncio.Queue(maxsize=1)
         self.process_task: Optional[asyncio.Task] = None
 
         self.last_poses_px: Optional[List[List[Tuple[int, int]]]] = None

@@ -957,8 +957,7 @@ class GSTWebRTCSession:
                 self._warn("Failed to map buffer from appsink")
                 return Gst.FlowReturn.ERROR
             try:
-                frame = np.frombuffer(mapinfo.data, dtype=np.uint8).reshape((h, w, 3))
-                frame_copy = frame.copy()
+                payload = bytes(mapinfo.data)  # one compact copy
                 pts_ns = int(buf.pts) if buf.pts is not None and buf.pts >= 0 else -1
             finally:
                 buf.unmap(mapinfo)
@@ -986,7 +985,7 @@ class GSTWebRTCSession:
                 )
 
             try:
-                self.loop.call_soon_threadsafe(self._enqueue_frame, frame_copy, pts_ns, w, h)
+                self.loop.call_soon_threadsafe(self._enqueue_frame, (payload, w, h), pts_ns, w, h)
             except Exception as e:
                 self._warn(f"call_soon_threadsafe enqueue failed: {e}")
 
@@ -1005,7 +1004,9 @@ class GSTWebRTCSession:
 
         while True:
             try:
-                frame, pts_ns = await self.frame_q.get()
+                (payload, w, h), pts_ns = await self.frame_q.get()
+                # build np view only now (no extra copy)
+                frame = np.frombuffer(payload, dtype=np.uint8).reshape((h, w, 3))
             except asyncio.CancelledError:
                 break
             except Exception as e:

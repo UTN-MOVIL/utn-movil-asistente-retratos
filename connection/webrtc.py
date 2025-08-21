@@ -136,6 +136,9 @@ NEGOTIATED_DCS        = os.getenv("NEGOTIATED_DCS", "1") == "1"
 DC_RESULTS_ID         = int(os.getenv("DC_RESULTS_ID", "0"))
 DC_CTRL_ID            = int(os.getenv("DC_CTRL_ID", "1"))
 
+# NEW: optional ICE wait time (0 = don't wait, return answer immediately)
+WAIT_FOR_ICE_MS       = int(os.getenv("WAIT_FOR_ICE_MS", "0"))  # 0 = don't wait
+
 # ─────────────── Estado global ───────────────
 _sessions: Set["GSTWebRTCSession"] = set()
 
@@ -630,18 +633,19 @@ class GSTWebRTCSession:
         prom_srd = Gst.Promise.new_with_change_func(_on_srd_applied, self.webrtc, self)
         self.webrtc.emit("set-remote-description", offer, prom_srd)
 
-        # 2) Wait for local answer to be set (briefly), then ICE gathering (up to 5s)
+        # 2) Wait for local answer to be set (briefly)
         try:
             await asyncio.wait_for(self._local_answer_set, timeout=3.0)
         except asyncio.TimeoutError:
             self._warn("Timeout waiting for local answer; continuing anyway")
 
-        # Wait for ICE gathering, but with a timeout — then return whatever we have.
-        try:
-            await asyncio.wait_for(self._gathering_done, timeout=5.0)
-            self._dbg("ICE gathering state: complete")
-        except asyncio.TimeoutError:
-            self._warn("ICE gathering timeout; returning early with partial candidates")
+        # 3) (Optional) wait a bit for ICE gathering; 0 = skip
+        if WAIT_FOR_ICE_MS > 0:
+            try:
+                await asyncio.wait_for(self._gathering_done, timeout=WAIT_FOR_ICE_MS / 1000.0)
+                self._dbg("ICE gathering state: complete")
+            except asyncio.TimeoutError:
+                self._warn(f"ICE gathering timeout after {WAIT_FOR_ICE_MS}ms; returning early")
 
         # Get local description
         local: GstWebRTC.WebRTCSessionDescription = self.webrtc.get_property("local-description")

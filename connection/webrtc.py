@@ -34,7 +34,7 @@ Gst.init(None)
 
 # ─────────────── Global logging switch ───────────────
 # When True → log everything via print; when False → absolutely no console output.
-PRINT_LOGS = os.getenv("PRINT_LOGS", "1") == "1"
+PRINT_LOGS = os.getenv("PRINT_LOGS", "0") == "1"
 
 def _noop(*_args, **_kwargs):
     return None

@@ -13,8 +13,9 @@ import threading
 import contextlib
 import traceback
 import inspect
+from dataclasses import dataclass
 from collections import deque
-from typing import Callable, Optional, Dict, Set, List, Tuple
+from typing import Callable, Optional, Dict, Set, List, Tuple, Any, Awaitable
 
 import numpy as np
 from sanic import Blueprint, response
@@ -33,7 +34,7 @@ Gst.init(None)
 
 # ─────────────── Global logging switch ───────────────
 # When True → log everything via print; when False → absolutely no console output.
-PRINT_LOGS = os.getenv("PRINT_LOGS", "0") == "1"
+PRINT_LOGS = os.getenv("PRINT_LOGS", "1") == "1"
 
 def _noop(*_args, **_kwargs):
     return None
@@ -107,12 +108,24 @@ def _exc_str(e: BaseException) -> str:
     return f"{e!r}\n{tb}"
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Tipos de funciones inyectadas:
-# - detect_image(mp_image) -> result
-# - detect_video(mp_image, ts_ms: int) -> result
-# - poses_px_from_result(result, img_shape) -> (w, h, List[List[Tuple[int,int]]])
-# - make_mp_image(rgb_np) -> mp.Image
+# Adapter API (modular multi-task):
+# - For each task:
+#   make_mp_image(rgb_np) -> mp.Image
+#   detect_image(mp_image) -> result
+#   detect_video(mp_image, ts_ms: int) -> result
+#   points_from_result(result, img_shape) -> (w, h, List[List[(x,y)]])
+# If you don't pass adapters, we fallback to the legacy single-task hooks.
 # ──────────────────────────────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class TaskAdapter:
+    name: str
+    make_mp_image: Callable[[np.ndarray], Any]
+    detect_image: Callable[[Any], Awaitable[Any] | Any]
+    detect_video: Callable[[Any, int], Awaitable[Any] | Any]
+    points_from_result: Callable[[Any, tuple[int, int, int]],
+                                 tuple[int, int, List[List[Tuple[int, int]]]]]
+    log_label: str = "keypoints"
 
 # ─────────────── Config por ENV ───────────────
 POSE_USE_VIDEO        = os.getenv("POSE_USE_VIDEO", "0") == "1"
@@ -135,8 +148,10 @@ AV1_SELFTEST_FILE = os.getenv("AV1_SELFTEST_FILE")  # optional file to decode at
 NEGOTIATED_DCS        = os.getenv("NEGOTIATED_DCS", "1") == "1"
 DC_RESULTS_ID         = int(os.getenv("DC_RESULTS_ID", "0"))
 DC_CTRL_ID            = int(os.getenv("DC_CTRL_ID", "1"))
-SEND_GREETING = os.getenv("SEND_GREETING", "0") == "1"
+SEND_GREETING         = os.getenv("SEND_GREETING", "0") == "1"
 
+# NEW: additional negotiated DC id for FACE (optional; others auto-assign)
+DC_FACE_ID            = int(os.getenv("DC_FACE_ID", "2"))
 
 # NEW: optional ICE wait time (0 = don't wait, return answer immediately)
 WAIT_FOR_ICE_MS       = int(os.getenv("WAIT_FOR_ICE_MS", "0"))  # 0 = don't wait
@@ -187,11 +202,11 @@ def _has_factory(name: str) -> bool:
 def pack_pose_frame(image_w: int, image_h: int, poses: List[List[Tuple[int, int]]]) -> bytes:
     out = bytearray()
     out += b"PO"
-    out += bytes([0])            # version
-    out += bytes([len(poses)])
+    out += bytes([0])  # version
+    out += struct.pack("<H", min(len(poses), 0xFFFF))
     out += struct.pack("<HH", image_w, image_h)
     for pts in poses:
-        out += bytes([len(pts)])
+        out += struct.pack("<H", min(len(pts), 0xFFFF))
         for (x, y) in pts:
             out += struct.pack("<HH", max(0, min(65535, x)), max(0, min(65535, y)))
     return bytes(out)
@@ -215,19 +230,23 @@ def pack_pose_frame_delta(
     if ver >= 1:
         out += struct.pack("<H", (seq or 0) & 0xFFFF)
 
-    out += bytes([len(curr)])
+    out += struct.pack("<H", min(len(curr), 0xFFFF))
     out += struct.pack("<HH", image_w, image_h)
 
     if keyframe:
         for pts in curr:
-            out += bytes([len(pts)])
+            out += struct.pack("<H", min(len(pts), 0xFFFF))
             for (x, y) in pts:
-                out += struct.pack("<HH", x, y)
+                out += struct.pack(
+                    "<HH",
+                    max(0, min(65535, x)),
+                    max(0, min(65535, y)),
+                )
         return bytes(out)
 
     for p, cpose in enumerate(curr):
         npts = len(cpose)
-        out += bytes([npts])
+        out += struct.pack("<H", min(npts, 0xFFFF))
         pmask = 0
         for i, (x, y) in enumerate(cpose):
             px, py = prev[p][i]
@@ -314,30 +333,32 @@ class GSTWebRTCSession:
     def __init__(
         self,
         *,
-        make_mp_image: Callable,
-        detect_image: Callable,
-        detect_video: Callable,
-        poses_px_from_result: Callable,
+        adapters: List[TaskAdapter],
         loop: asyncio.AbstractEventLoop,
     ):
         self.loop = loop
 
-        self.make_mp_image = make_mp_image
-        self.detect_image = detect_image
-        self.detect_video = detect_video
-        self.poses_px_from_result = poses_px_from_result
+        # Multi-task adapters (at least one)
+        assert adapters and isinstance(adapters, list), "adapters list required"
+        self.adapters: List[TaskAdapter] = adapters
 
         self.pipeline: Optional[Gst.Pipeline] = None
         self.webrtc: Optional[Gst.Element] = None
 
-        self.results_dc: Optional[GstWebRTC.WebRTCDataChannel] = None
+        # Per-task negotiated result DCs; keep legacy aliases for the first and for face
+        self.result_dcs: Dict[str, GstWebRTC.WebRTCDataChannel] = {}
+        self.results_dc: Optional[GstWebRTC.WebRTCDataChannel] = None  # alias of first adapter DC
+        self.face_dc: Optional[GstWebRTC.WebRTCDataChannel] = None     # convenience
         self.ctrl_dc: Optional[GstWebRTC.WebRTCDataChannel] = None
 
         # Create asyncio primitives on the right loop/thread
         self.frame_q: asyncio.Queue = asyncio.Queue(maxsize=1)
         self.process_task: Optional[asyncio.Task] = None
 
-        self.last_poses_px: Optional[List[List[Tuple[int, int]]]] = None
+        # Per-adapter last points for delta packing
+        self._prev_pts: Dict[str, List[List[Tuple[int, int]]]] = {}
+
+        # Timing / control (shared across tasks)
         self.last_key_ms: int = 0
         self.last_sent_ms: int = 0
         self.last_change_ms: int = 0
@@ -347,7 +368,7 @@ class GSTWebRTCSession:
         self.seq: int = 0
         self.last_ts_input: int = 0
 
-        # ACK tracking (seq -> ts_ms)
+        # ACK tracking (for the primary results DC)
         self._awaiting_ack: Dict[int, int] = {}
         self._ack_warned: Set[int] = set()
         self.last_ack_seq: Optional[int] = None
@@ -381,7 +402,7 @@ class GSTWebRTCSession:
         # ── New: ring buffer for bus diagnostics
         self._bus_tail: deque[str] = deque(maxlen=50)
 
-        self._info("New session created")
+        self._info(f"New session created; tasks={[a.name for a in adapters]}")
 
     # ─────────────── session-scope print helpers ───────────────
     def _info(self, msg: str):
@@ -503,28 +524,53 @@ class GSTWebRTCSession:
 
         self._info("Pipeline constructed")
 
-    # Create negotiated channels (id=0 results, id=1 ctrl). Call only after SRD.
+    # Create negotiated channels: one per adapter (unordered lossy), plus ctrl (reliable).
     def _precreate_negotiated_dcs(self):
         if not self.webrtc:
             return
-        if self.results_dc or self.ctrl_dc:
+        if self.result_dcs or self.ctrl_dc:
             # Already created
             return
-        try:
-            # results: unordered + lossy, negotiated id
-            opts_res = Gst.Structure.new_empty("application/webrtc-data-channel")
-            opts_res.set_value("ordered", False)
-            opts_res.set_value("max-retransmits", 0)
-            opts_res.set_value("negotiated", True)
-            opts_res.set_value("id", DC_RESULTS_ID)
-            self.results_dc = self.webrtc.emit("create-data-channel", "results", opts_res)
-            self._wire_results_dc(self.results_dc)
-            self._info(f"Created negotiated DC 'results' id={DC_RESULTS_ID} (unordered, maxRetransmits=0)")
-        except Exception as e:
-            self._warn(f"Failed to create negotiated 'results' datachannel: {e}")
+        assigned_ids: Set[int] = set()
+        next_id = max(DC_RESULTS_ID, DC_CTRL_ID, DC_FACE_ID) + 1
 
+        for idx, ad in enumerate(self.adapters):
+            if idx == 0:
+                label = "results"
+                dcid = DC_RESULTS_ID
+            else:
+                label = f"results:{ad.name}"
+                # Reserve FACE id if requested, otherwise auto-increment
+                dcid = DC_FACE_ID if ad.name.lower() == "face" else next_id
+                if ad.name.lower() != "face":
+                    next_id += 1
+            if dcid in assigned_ids or dcid in (DC_CTRL_ID,):
+                # find next free
+                while next_id in assigned_ids or next_id in (DC_RESULTS_ID, DC_CTRL_ID, DC_FACE_ID):
+                    next_id += 1
+                dcid = next_id
+                next_id += 1
+            assigned_ids.add(dcid)
+
+            try:
+                opts = Gst.Structure.new_empty("application/webrtc-data-channel")
+                opts.set_value("ordered", False)
+                opts.set_value("max-retransmits", 0)
+                opts.set_value("negotiated", True)
+                opts.set_value("id", dcid)
+                dc = self.webrtc.emit("create-data-channel", label, opts)
+                self.result_dcs[ad.name] = dc
+                self._wire_results_dc(dc)
+                self._info(f"Created negotiated DC '{label}' id={dcid} (unordered, maxRetransmits=0)")
+                if idx == 0:
+                    self.results_dc = dc
+                if ad.name.lower() == "face":
+                    self.face_dc = dc
+            except Exception as e:
+                self._warn(f"Failed to create negotiated datachannel '{label}': {e}")
+
+        # ctrl: reliable, negotiated id
         try:
-            # ctrl: reliable, negotiated id
             opts_ctrl = Gst.Structure.new_empty("application/webrtc-data-channel")
             opts_ctrl.set_value("ordered", True)  # reliable default
             opts_ctrl.set_value("negotiated", True)
@@ -583,6 +629,8 @@ class GSTWebRTCSession:
         self.pipeline = None
         self.webrtc = None
         self.results_dc = None
+        self.face_dc = None
+        self.result_dcs.clear()
         self.ctrl_dc = None
         self._info("Session stopped")
 
@@ -660,8 +708,8 @@ class GSTWebRTCSession:
         if not dc:
             return
         def on_open(ch):
-            self._info("DataChannel 'results' open")
-            if SEND_GREETING:
+            self._info(f"DataChannel '{ch.props.label}' open")
+            if SEND_GREETING and (ch.props.label or "").startswith("results"):
                 try:
                     ch.emit("send-string", "HELLO_FROM_SERVER")
                 except Exception as e:
@@ -670,24 +718,24 @@ class GSTWebRTCSession:
                     pkt = b"PO" + bytes([0, 0]) + struct.pack("<HH", 1, 1)
                     gbytes = GLib.Bytes(pkt)
                     ch.emit("send-data", gbytes)
-                    self._dbg("Sent dummy PO packet on 'results' (1x1, 0 poses)")
+                    self._dbg(f"Sent dummy PO packet on '{ch.props.label}' (1x1, 0 poses)")
                 except Exception as e:
                     self._warn(f"send-data dummy failed: {e}")
 
         def on_close(ch):
-            self._warn("DataChannel 'results' closed")
+            self._warn(f"DataChannel '{ch.props.label}' closed")
         def on_error(ch, err):
-            self._warn(f"DataChannel 'results' error: {err}")
+            self._warn(f"DataChannel '{ch.props.label}' error: {err}")
 
         def _on_msg_str(ch, msg):
             if isinstance(msg, str) and msg.strip().upper() == "KF":
-                self._info("Received KF on 'results' (string) → will keyframe next send")
+                self._info(f"Received KF on '{ch.props.label}' (string) → will keyframe next send")
                 self.need_keyframe = True
         def _on_msg_bin(ch, data):
             try:
                 b = _as_bytes(data)
                 if b and b.strip().upper() == b"KF":
-                    self._info("Received KF on 'results' (binary) → will keyframe next send")
+                    self._info(f"Received KF on '{ch.props.label}' (binary) → will keyframe next send")
                     self.need_keyframe = True
             except Exception:
                 pass
@@ -772,6 +820,13 @@ class GSTWebRTCSession:
         self._dbg(f"on-data-channel: '{label}' readyState={channel.get_property('ready-state')}")
         if label == "results":
             self.results_dc = channel
+            self.result_dcs[self.adapters[0].name] = channel
+            self._wire_results_dc(channel)
+        elif label.startswith("results:"):
+            adname = label.split(":", 1)[1].strip().lower() or "default"
+            self.result_dcs[adname] = channel
+            if adname == "face":
+                self.face_dc = channel
             self._wire_results_dc(channel)
         elif label == "ctrl":
             self.ctrl_dc = channel
@@ -1027,63 +1082,51 @@ class GSTWebRTCSession:
                 ts_ms = self.last_ts_input + 1
             self.last_ts_input = ts_ms
 
+            # ACK overdue checks (primary channel only)
             if RESULTS_REQUIRE_ACK and self._awaiting_ack:
                 to_warn = [s for s, t0 in list(self._awaiting_ack.items()) if (ts_ms - t0) >= ACK_WARN_MS and s not in self._ack_warned]
                 for s in to_warn:
                     self._ack_warned.add(s)
                     self._warn(f"ACK overdue for seq={s} > {ACK_WARN_MS}ms")
 
-            dc = self.results_dc
-            if not dc or dc.get_property("ready-state") != GstWebRTC.WebRTCDataChannelState.OPEN:
-                continue
-
-            buf_amt = dc.get_property("buffered-amount") or 0
-
-            if buf_amt >= SEND_THRESHOLD:
-                # For negotiated channels, don't try to recreate with the same id.
-                congested_since_ms = congested_since_ms or ts_ms
-                if (ts_ms - (congested_since_ms or ts_ms)) >= RECYCLE_AFTER_MS:
-                    self._info("Results DC congested; will skip frames and force next send as keyframe (no DC recycle for negotiated)")
-                    congested_since_ms = None
-                    self.last_key_ms = 0
-                    self.last_poses_px = None
-                    self.need_keyframe = True
-                self.stats["drops_due_buffer"] = int(self.stats["drops_due_buffer"]) + 1
-                self._dbg(f"Dropping frame due to buffered-amount={buf_amt}")
-                continue
-            else:
-                congested_since_ms = None
-
+            # Rate-gate globally for all adapters
             if (ts_ms - self.last_sent_ms) < MIN_SEND_MS:
                 continue
 
             try:
+                # Run all adapters concurrently for this frame
+                async def run_one(ad: TaskAdapter):
+                    mp_img = ad.make_mp_image(frame)
+                    if POSE_USE_VIDEO:
+                        if inspect.iscoroutinefunction(ad.detect_video):
+                            res = await ad.detect_video(mp_img, ts_ms)
+                        else:
+                            res = await asyncio.to_thread(ad.detect_video, mp_img, ts_ms)
+                    else:
+                        if inspect.iscoroutinefunction(ad.detect_image):
+                            res = await ad.detect_image(mp_img)
+                        else:
+                            res = await asyncio.to_thread(ad.detect_image, mp_img)
+                    w0, h0, pts = ad.points_from_result(res, frame.shape)
+                    prev = self._prev_pts.get(ad.name)
+                    # Keyframe if first time or number of instances changed
+                    kf = prev is None or (prev is not None and len(prev) != len(pts))
+                    self.seq = (self.seq + 1) & 0xFFFF
+                    packet = pack_pose_frame_delta(prev, pts, w0, h0, keyframe=kf, seq=self.seq, ver=2) \
+                             if "pack_pose_frame_delta" in globals() else pack_pose_frame(w0, h0, pts)
+                    return ad.name, (w0, h0), pts, packet, kf
+
                 t0 = time.perf_counter()
-                mp_image = self.make_mp_image(frame)
-                img_shape = (frame.shape[0], frame.shape[1], 3)
-
-                fn, args = (
-                    (self.detect_video, (mp_image, ts_ms))
-                    if POSE_USE_VIDEO
-                    else (self.detect_image, (mp_image,))
-                )
-
-                if inspect.iscoroutinefunction(fn):
-                    result = await fn(*args)
-                else:
-                    result = await asyncio.to_thread(fn, *args)
-
-                w0, h0, poses_px = self.poses_px_from_result(result, img_shape)
+                results = await asyncio.gather(*(run_one(ad) for ad in self.adapters))
                 infer_ms = (time.perf_counter() - t0) * 1000.0
                 self.stats["infer_ms_last"] = float(infer_ms)
                 prev_avg = float(self.stats["infer_ms_avg"])
                 self.stats["infer_ms_avg"] = prev_avg * 0.9 + infer_ms * 0.1
 
-                num_poses = len(poses_px)
-                pts_per_pose = [len(p) for p in poses_px]
-                self._dbg(f"POSES count={num_poses} pts_per_pose={pts_per_pose} infer_ms={infer_ms:.2f}")
-
-                changed = (poses_px != self.last_poses_px)
+                # Detect inactivity/change against the PRIMARY adapter (first one)
+                primary_name = self.adapters[0].name
+                primary_pts = next((pts for (name, _wh, pts, _pkt, _kf) in results if name == primary_name), None)
+                changed = (primary_pts != self._prev_pts.get(primary_name))
                 if changed or self.last_change_ms == 0:
                     self.last_change_ms = ts_ms
 
@@ -1095,69 +1138,74 @@ class GSTWebRTCSession:
 
                 external_kf = self.need_keyframe
                 self.need_keyframe = False
-
-                force_key   = (self.last_poses_px is None) or (len(self.last_poses_px) != len(poses_px))
                 gap_key     = (ts_ms - self.last_sent_ms) > 250
                 stale_key   = (ts_ms - self.last_key_ms) >= 300
                 nochange_kf = (ts_ms - self.last_change_ms) >= 400
                 first_move_after_idle = changed and (self.idle_start_ms is not None)
                 heartbeat_abs = ABSOLUTE_INTERVAL_MS > 0 and (ts_ms - self.last_abs_ms) >= ABSOLUTE_INTERVAL_MS
+                force_kf = (external_kf or gap_key or stale_key or nochange_kf or first_move_after_idle or heartbeat_abs)
 
-                need_key = (
-                    external_kf or force_key or gap_key or stale_key or
-                    nochange_kf or first_move_after_idle or heartbeat_abs
-                )
+                # Send per-adapter on its specific DC (skip if congested)
+                sent_any = False
+                for name, (w0, h0), pts, packet, kf_local in results:
+                    dc = self.result_dcs.get(name)
+                    if not dc or dc.get_property("ready-state") != GstWebRTC.WebRTCDataChannelState.OPEN:
+                        continue
 
-                self.seq = (self.seq + 1) & 0xFFFF
+                    # Buffered-amount check per channel
+                    buf_amt = dc.get_property("buffered-amount") or 0
+                    if buf_amt >= SEND_THRESHOLD:
+                        self.stats["drops_due_buffer"] = int(self.stats["drops_due_buffer"]) + 1
+                        self._dbg(f"Skip '{name}' send: buffered-amount={buf_amt}")
+                        continue
 
-                if "pack_pose_frame_delta" in globals():
-                    packet = pack_pose_frame_delta(
-                        self.last_poses_px, poses_px, w0, h0, need_key, seq=self.seq, ver=2
-                    )
-                    if need_key:
+                    # If we need a forced KF, rebuild packet as absolute for this adapter
+                    if force_kf and "pack_pose_frame_delta" in globals():
+                        packet = pack_pose_frame_delta(self._prev_pts.get(name), pts, w0, h0, keyframe=True, seq=self.seq, ver=2)
+                        kf_local = True
+
+                    try:
+                        try:
+                            dc.emit("send-data", GLib.Bytes(packet))
+                        except Exception:
+                            gstbuf = Gst.Buffer.new_allocate(None, len(packet), None)
+                            gstbuf.fill(0, packet)
+                            dc.emit("send-data", gstbuf)
+                        sent_any = True
+                        self._prev_pts[name] = pts
+                        self.stats["frames_sent"] = int(self.stats["frames_sent"]) + 1
+                        self.stats["bytes_sent"]  = int(self.stats["bytes_sent"]) + len(packet)
+                        if kf_local:
+                            self.stats["kf_sent"] = int(self.stats["kf_sent"]) + 1
+                        else:
+                            self.stats["delta_sent"] = int(self.stats["delta_sent"]) + 1
+
+                        self._info(
+                            f"[{name}] PACKET {'PD' if packet[:2]==b'PD' else 'PO'} "
+                            f"{'KF' if kf_local or force_kf else 'Δ'} seq={self.seq:04d} "
+                            f"bytes={len(packet)} bufAmt={(dc.get_property('buffered-amount') or 0)} "
+                            f"pts-per-obj={[len(p) for p in pts]} "
+                            f"infer_ms(last/avg)={self.stats['infer_ms_last']:.2f}/{self.stats['infer_ms_avg']:.2f}"
+                        )
+
+                    except Exception as e:
+                        self._warn(f"Send error on DC '{name}': {e}")
+                        continue
+
+                if sent_any:
+                    self.last_sent_ms = ts_ms
+                    if force_kf:
                         self.last_key_ms = ts_ms
                         self.last_abs_ms = ts_ms
-                    packet_kind = "PD"
-                else:
-                    packet = pack_pose_frame(w0, h0, poses_px)
-                    self.last_key_ms = ts_ms
-                    self.last_abs_ms = ts_ms
-                    need_key = True
-                    packet_kind = "PO"
 
-                if (self.results_dc and
-                    self.results_dc.get_property("ready-state") == GstWebRTC.WebRTCDataChannelState.OPEN and
-                    (self.results_dc.get_property("buffered-amount") or 0) < SEND_THRESHOLD):
-                    try:
-                        gbytes = GLib.Bytes(packet)
-                        self.results_dc.emit("send-data", gbytes)
-                    except Exception:
-                        gstbuf = Gst.Buffer.new_allocate(None, len(packet), None)
-                        gstbuf.fill(0, packet)
-                        self.results_dc.emit("send-data", gstbuf)
-
-                    self.last_sent_ms = ts_ms
-                    self.last_poses_px = poses_px
-                    self.stats["frames_sent"] = int(self.stats["frames_sent"]) + 1
-                    self.stats["bytes_sent"]  = int(self.stats["bytes_sent"]) + len(packet)
-                    if need_key:
-                        self.stats["kf_sent"] = int(self.stats["kf_sent"]) + 1
-                    else:
-                        self.stats["delta_sent"] = int(self.stats["delta_sent"]) + 1
-
-                    self._info(
-                        f"PACKET kind={packet_kind} {'KF' if need_key else 'Δ'} "
-                        f"seq={self.seq:04d} bytes={len(packet)} "
-                        f"bufAmt={(self.results_dc.get_property('buffered-amount') or 0)} "
-                        f"poses={num_poses} pts={pts_per_pose} "
-                        f"infer_ms(last/avg)={self.stats['infer_ms_last']:.2f}/{self.stats['infer_ms_avg']:.2f}"
-                    )
-
-                    if RESULTS_REQUIRE_ACK:
+                    # ACK tracking only for primary channel (optional)
+                    if RESULTS_REQUIRE_ACK and self.results_dc:
                         self._awaiting_ack[self.seq] = ts_ms
                         self._dbg(f"Awaiting ACK for seq={self.seq}")
+
                 else:
-                    self._dbg("Skip send: DC closed or buffered-amount high")
+                    self._dbg("Skip send: all DCs closed or buffered-amount high")
+
             except Exception as e:
                 self._warn(f"Inference/send error: {e}")
                 continue
@@ -1226,6 +1274,9 @@ class GSTWebRTCSession:
                 "stats": dict(self.stats),
                 "bus_tail": list(self._bus_tail),
                 "factories": factories,
+                "adapters": [a.name for a in self.adapters],
+                "result_dcs": {k: (v.get_property("ready-state").value_nick if v else None)
+                               for k, v in self.result_dcs.items()},
             }
         except Exception as e:
             return {"snapshot_error": str(e)}
@@ -1233,10 +1284,14 @@ class GSTWebRTCSession:
 # ─────────────── Constructor del Blueprint WebRTC (Sanic) ───────────────
 def build_webrtc_blueprint(
     *,
-    make_mp_image: Callable,
-    detect_image: Callable,
-    detect_video: Callable,
-    poses_px_from_result: Callable,
+    # Legacy single-task hooks (back-compat)
+    make_mp_image: Callable | None = None,
+    detect_image: Callable | None = None,
+    detect_video: Callable | None = None,
+    poses_px_from_result: Callable | None = None,
+    # New: multiple adapters
+    adapters: Dict[str, TaskAdapter] | None = None,
+    default_task: str = "pose",
     url_prefix: str = "",
 ) -> Blueprint:
 
@@ -1288,13 +1343,39 @@ def build_webrtc_blueprint(
         sdp_head = (params.get("sdp") or "")[:512]
 
         loop = asyncio.get_event_loop()
-        sess = GSTWebRTCSession(
-            make_mp_image=make_mp_image,
-            detect_image=detect_image,
-            detect_video=detect_video,
-            poses_px_from_result=poses_px_from_result,
-            loop=loop,
-        )
+
+        # Select adapters: multi-task or legacy single-task fallback
+        selected_adapters: List[TaskAdapter]
+        if adapters:
+            tasks = params.get("tasks")
+            if isinstance(tasks, list) and tasks:
+                selected_adapters = []
+                for t in tasks:
+                    key = str(t).lower()
+                    if key in adapters:
+                        selected_adapters.append(adapters[key])
+                if not selected_adapters:
+                    return response.json({"error": "no valid tasks in 'tasks'", "allowed": list(adapters)}, status=400)
+            else:
+                key = str(params.get("task") or default_task).lower()
+                if key not in adapters:
+                    return response.json({"error": f"unknown task '{key}'",
+                                          "allowed": list(adapters)}, status=400)
+                selected_adapters = [adapters[key]]
+        else:
+            # Build a single default adapter from legacy hooks
+            if not (make_mp_image and detect_image and detect_video and poses_px_from_result):
+                return response.json({"error": "No adapters provided and legacy hooks incomplete"}, status=500)
+            selected_adapters = [TaskAdapter(
+                name="default",
+                make_mp_image=make_mp_image,
+                detect_image=detect_image,
+                detect_video=detect_video,
+                points_from_result=poses_px_from_result,
+                log_label="default"
+            )]
+
+        sess = GSTWebRTCSession(adapters=selected_adapters, loop=loop)
         _sessions.add(sess)
         sess.start()
 

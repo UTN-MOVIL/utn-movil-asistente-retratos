@@ -35,7 +35,7 @@ from modulos.puntos_faciales import (
 )
 
 # ─────────────── WebRTC en módulo aparte ───────────────
-from connection.webrtc import build_webrtc_blueprint  # <— NUEVO
+from connection.webrtc import build_webrtc_blueprint, TaskAdapter  # <— UPDATED
 
 app = Sanic("MiAppHttpWebSocket")
 
@@ -252,7 +252,24 @@ def _poses_px_from_result(result, img_shape) -> Tuple[int, int, List[List[Tuple[
         poses_px.append(pts)
     return w, h, poses_px
 
-# ───────── Wrappers de inferencia para inyectar al módulo WebRTC ─────────
+# ───────── Face → píxeles y wrappers (para WebRTC) ─────────
+def _faces_px_from_result(result, img_shape) -> Tuple[int, int, List[List[Tuple[int, int]]]]:
+    """Convierte landmarks faciales normalizados → píxeles absolutos."""
+    h, w = img_shape[:2]
+    faces_px: List[List[Tuple[int, int]]] = []
+    if not result or not getattr(result, "face_landmarks", None):
+        return w, h, faces_px
+    for lms in result.face_landmarks:
+        pts: List[Tuple[int, int]] = []
+        for lm in lms:
+            x = int(round(lm.x * w))
+            y = int(round(lm.y * h))
+            x = 0 if x < 0 else (w - 1 if x >= w else x)
+            y = 0 if y < 0 else (h - 1 if y >= h else y)
+            pts.append((x, y))
+        faces_px.append(pts)
+    return w, h, faces_px
+
 def _make_mp_image(rgb_np: np.ndarray):
     # rgb_np: (H,W,3) uint8
     return mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_np)
@@ -275,13 +292,37 @@ async def _detect_pose_video(mp_image: mp.Image, ts_ms: int):
             raise RuntimeError("No hay landmarker de pose inicializado.")
         return pose_landmarker_image.detect(mp_image)
 
-# ───────── Registrar el Blueprint WebRTC ─────────
+async def _detect_face_image(mp_image: mp.Image):
+    """Face en modo IMAGE (usado también en WebRTC)."""
+    global face_landmarker, face_lock
+    if face_landmarker is None or face_lock is None:
+        raise RuntimeError("FaceLandmarker no está inicializado.")
+    async with face_lock:
+        return face_landmarker.detect(mp_image)
+
+async def _detect_face_video(mp_image: mp.Image, ts_ms: int):
+    """Wrapper VIDEO para Face que delega a IMAGE."""
+    return await _detect_face_image(mp_image)
+
+# ───────── Registrar el Blueprint WebRTC (dos tareas: pose + face) ─────────
 webrtc_bp = build_webrtc_blueprint(
-    make_mp_image=_make_mp_image,
-    detect_image=_detect_pose_image,
-    detect_video=_detect_pose_video,
-    poses_px_from_result=_poses_px_from_result,
-    url_prefix="",  # deja /webrtc/offer
+    adapters={
+        "pose": TaskAdapter(
+            name="pose",
+            make_mp_image=_make_mp_image,
+            detect_image=_detect_pose_image,
+            detect_video=_detect_pose_video,
+            points_from_result=_poses_px_from_result,
+        ),
+        "face": TaskAdapter(
+            name="face",
+            make_mp_image=_make_mp_image,
+            detect_image=_detect_face_image,
+            detect_video=_detect_face_video,
+            points_from_result=_faces_px_from_result,
+        ),
+    },
+    url_prefix="",
 )
 app.blueprint(webrtc_bp)
 

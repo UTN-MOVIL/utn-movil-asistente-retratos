@@ -22,6 +22,7 @@ from sanic import Blueprint, response
 
 # ─────────────── GStreamer / GI ───────────────
 import gi
+
 gi.require_version("Gst", "1.0")
 gi.require_version("GstWebRTC", "1.0")
 gi.require_version("GstApp", "1.0")
@@ -32,33 +33,47 @@ from .decoding import attach_rtp_video_decode_chain  # ← keeps decode chain se
 
 Gst.init(None)
 
+
 # ─────────────── Global logging switch ───────────────
 # When True → log everything via print; when False → absolutely no console output.
 PRINT_LOGS = os.getenv("PRINT_LOGS", "0") == "1"
 
+
 def _noop(*_args, **_kwargs):
     return None
+
 
 def _log_print(*args, **kwargs):
     if PRINT_LOGS:
         print(*args, **kwargs)
 
+
 # ─────────────── Hard mute of external loggers when PRINT_LOGS=0 ───────────────
 if not PRINT_LOGS:
     import logging, warnings, sys
+
     # 1) Disable stdlib logging everywhere
     logging.disable(logging.CRITICAL)
     for name in (
-        "asyncio", "sanic.root", "sanic.error", "sanic.access", "sanic.server",
-        "uvicorn", "gunicorn", "uvloop", "aiohttp",
+        "asyncio",
+        "sanic.root",
+        "sanic.error",
+        "sanic.access",
+        "sanic.server",
+        "uvicorn",
+        "gunicorn",
+        "uvloop",
+        "aiohttp",
     ):
         try:
             logging.getLogger(name).disabled = True
             logging.getLogger(name).setLevel(logging.CRITICAL)
         except Exception:
             pass
+
     # 2) Hide warnings
     warnings.filterwarnings("ignore")
+
     # 3) Ensure asyncio debug/slow-callback logs are OFF
     try:
         os.environ.pop("PYTHONASYNCIODEBUG", None)
@@ -74,12 +89,14 @@ if not PRINT_LOGS:
                 pass
     except Exception:
         pass
+
     # 4) GStreamer/GLib quiet
     try:
         Gst.debug_set_active(False)
         Gst.debug_set_threshold_from_string("0", True)
     except Exception:
         pass
+
     # 5) Optional nuclear option: also redirect stdout/stderr to /dev/null when HARD_MUTE_STDIO=1
     if os.getenv("HARD_MUTE_STDIO", "0") == "1":
         try:
@@ -89,23 +106,29 @@ if not PRINT_LOGS:
         except Exception:
             pass
 
+
 # ─────────────── Small logging helpers (print-only) ───────────────
 def _ts():
     return time.strftime("%H:%M:%S")
 
+
 def _ginfo(msg: str):
-    _log_print(f"Srv 0 {_ts()} INFO:   {msg}", flush=True)
+    _log_print(f"Srv 0 {_ts()} INFO: {msg}", flush=True)
+
 
 def _gwarn(msg: str):
-    _log_print(f"Srv 0 {_ts()} WARN:   {msg}", flush=True)
+    _log_print(f"Srv 0 {_ts()} WARN: {msg}", flush=True)
+
 
 def _gdebug(msg: str):
-    _log_print(f"Srv 0 {_ts()} DEBUG:  {msg}", flush=True)
+    _log_print(f"Srv 0 {_ts()} DEBUG: {msg}", flush=True)
+
 
 def _exc_str(e: BaseException) -> str:
     """repr + traceback for returning in JSON and printing."""
     tb = traceback.format_exc()
     return f"{e!r}\n{tb}"
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Adapter API (modular multi-task):
@@ -116,45 +139,44 @@ def _exc_str(e: BaseException) -> str:
 #   points_from_result(result, img_shape) -> (w, h, List[List[(x,y)]])
 # If you don't pass adapters, we fallback to the legacy single-task hooks.
 # ──────────────────────────────────────────────────────────────────────────────
-
 @dataclass(frozen=True)
 class TaskAdapter:
     name: str
     make_mp_image: Callable[[np.ndarray], Any]
     detect_image: Callable[[Any], Awaitable[Any] | Any]
     detect_video: Callable[[Any, int], Awaitable[Any] | Any]
-    points_from_result: Callable[[Any, tuple[int, int, int]],
-                                 tuple[int, int, List[List[Tuple[int, int]]]]]
+    points_from_result: Callable[[Any, tuple[int, int, int]], tuple[int, int, List[List[Tuple[int, int]]]]]
     log_label: str = "keypoints"
 
+
 # ─────────────── Config por ENV ───────────────
-POSE_USE_VIDEO        = os.getenv("POSE_USE_VIDEO", "0") == "1"
-ABSOLUTE_INTERVAL_MS  = int(os.getenv("ABSOLUTE_INTERVAL_MS", "0"))
-IDLE_TO_FORCE_KF_MS   = int(os.getenv("IDLE_TO_FORCE_KF_MS", "500"))
-FRAME_GAP_WARN_MS     = int(os.getenv("FRAME_GAP_WARN_MS", "180"))
+POSE_USE_VIDEO = os.getenv("POSE_USE_VIDEO", "0") == "1"
+ABSOLUTE_INTERVAL_MS = int(os.getenv("ABSOLUTE_INTERVAL_MS", "0"))
+IDLE_TO_FORCE_KF_MS = int(os.getenv("IDLE_TO_FORCE_KF_MS", "500"))
+FRAME_GAP_WARN_MS = int(os.getenv("FRAME_GAP_WARN_MS", "180"))
 
 # ACK opcional (confirma entrega real desde el cliente por 'ctrl')
-RESULTS_REQUIRE_ACK   = os.getenv("RESULTS_REQUIRE_ACK", "0") == "1"
-ACK_WARN_MS           = int(os.getenv("ACK_WARN_MS", "400"))
+RESULTS_REQUIRE_ACK = os.getenv("RESULTS_REQUIRE_ACK", "0") == "1"
+ACK_WARN_MS = int(os.getenv("ACK_WARN_MS", "400"))
 
-STUN_URL  = os.getenv("STUN_URL", "stun:stun.l.google.com:19302")
-TURN_URL  = os.getenv("TURN_URL")
+STUN_URL = os.getenv("STUN_URL", "stun:stun.l.google.com:19302")
+TURN_URL = os.getenv("TURN_URL")
 TURN_USER = os.getenv("TURN_USERNAME")
 TURN_PASS = os.getenv("TURN_PASSWORD")
 
 AV1_SELFTEST_FILE = os.getenv("AV1_SELFTEST_FILE")  # optional file to decode at startup
 
 # NEW: force negotiated (pre-created) data channels to skip DCEP
-NEGOTIATED_DCS        = os.getenv("NEGOTIATED_DCS", "1") == "1"
-DC_RESULTS_ID         = int(os.getenv("DC_RESULTS_ID", "0"))
-DC_CTRL_ID            = int(os.getenv("DC_CTRL_ID", "1"))
-SEND_GREETING         = os.getenv("SEND_GREETING", "0") == "1"
-
+NEGOTIATED_DCS = os.getenv("NEGOTIATED_DCS", "1") == "1"
+DC_RESULTS_ID = int(os.getenv("DC_RESULTS_ID", "0"))
+DC_CTRL_ID = int(os.getenv("DC_CTRL_ID", "1"))
+SEND_GREETING = os.getenv("SEND_GREETING", "0") == "1"
 # NEW: additional negotiated DC id for FACE (optional; others auto-assign)
-DC_FACE_ID            = int(os.getenv("DC_FACE_ID", "2"))
+DC_FACE_ID = int(os.getenv("DC_FACE_ID", "2"))
 
 # NEW: optional ICE wait time (0 = don't wait, return answer immediately)
-WAIT_FOR_ICE_MS       = int(os.getenv("WAIT_FOR_ICE_MS", "0"))  # 0 = don't wait
+WAIT_FOR_ICE_MS = int(os.getenv("WAIT_FOR_ICE_MS", "0"))  # 0 = don't wait
+
 
 # ─────────────── Estado global ───────────────
 _sessions: Set["GSTWebRTCSession"] = set()
@@ -171,11 +193,13 @@ except Exception:
     # Fallbacks if run as a single file or import path differs
     CANDIDATE_ENCODERS = ["vah265enc", "vaapih265enc", "nvh265enc", "x265enc"]
     CANDIDATE_DECODERS = ["vah265dec", "vaapih265dec", "nvh265dec", "avdec_h265"]
+
     def _find_first_factory(names):
         for n in names:
             if Gst.ElementFactory.find(n):
                 return n
         return None
+
 
 def _ensure_gst_mainloop():
     global _gst_loop_started, _gst_loop, _gst_loop_thread
@@ -184,6 +208,7 @@ def _ensure_gst_mainloop():
     _gst_loop_started = True
     _gst_loop = GLib.MainLoop()
     _ginfo("Starting GstMainLoop thread")
+
     def _run():
         try:
             _gst_loop.run()
@@ -191,12 +216,15 @@ def _ensure_gst_mainloop():
             _gwarn(f"GstMainLoop exited with error: {e}")
         finally:
             _ginfo("GstMainLoop finished")
+
     _gst_loop_thread = threading.Thread(target=_run, name="GstMainLoop", daemon=True)
     _gst_loop_thread.start()
+
 
 # Helper to check element availability
 def _has_factory(name: str) -> bool:
     return Gst.ElementFactory.find(name) is not None
+
 
 # ─────────────── Empaquetadores binarios (PO/PD) ───────────────
 def pack_pose_frame(image_w: int, image_h: int, poses: List[List[Tuple[int, int]]]) -> bytes:
@@ -211,6 +239,7 @@ def pack_pose_frame(image_w: int, image_h: int, poses: List[List[Tuple[int, int]
             out += struct.pack("<HH", max(0, min(65535, x)), max(0, min(65535, y)))
     return bytes(out)
 
+
 def pack_pose_frame_delta(
     prev: List[List[Tuple[int, int]]] | None,
     curr: List[List[Tuple[int, int]]],
@@ -223,27 +252,21 @@ def pack_pose_frame_delta(
 ) -> bytes:
     absolute_needed = (prev is None) or (len(prev) != len(curr))
     keyframe = keyframe or absolute_needed
-
     out = bytearray(b"PD")
     out += bytes([ver & 0xFF])
     out += bytes([1 if keyframe else 0])
     if ver >= 1:
         out += struct.pack("<H", (seq or 0) & 0xFFFF)
-
     out += struct.pack("<H", min(len(curr), 0xFFFF))
     out += struct.pack("<HH", image_w, image_h)
-
     if keyframe:
         for pts in curr:
             out += struct.pack("<H", min(len(pts), 0xFFFF))
             for (x, y) in pts:
                 out += struct.pack(
-                    "<HH",
-                    max(0, min(65535, x)),
-                    max(0, min(65535, y)),
+                    "<HH", max(0, min(65535, x)), max(0, min(65535, y)),
                 )
         return bytes(out)
-
     for p, cpose in enumerate(curr):
         npts = len(cpose)
         out += struct.pack("<H", min(npts, 0xFFFF))
@@ -254,7 +277,6 @@ def pack_pose_frame_delta(
                 pmask |= (1 << i)
         mask_bytes = (npts + 7) // 8
         out += int(pmask).to_bytes(mask_bytes, "little", signed=False)
-
         for i, (x, y) in enumerate(cpose):
             if (pmask >> i) & 1:
                 dx = max(-127, min(127, x - prev[p][i][0]))
@@ -262,10 +284,12 @@ def pack_pose_frame_delta(
                 out += struct.pack("<bb", dx, dy)
     return bytes(out)
 
+
 # ─────────────── PyAV-based AV1 decoder check (opcional) ───────────────
 def _pyav_has_av1_decoder() -> bool:
     try:
         import av  # lazy
+
         CodecContext = getattr(av, "CodecContext", None)
         if CodecContext is None:
             return False
@@ -274,21 +298,21 @@ def _pyav_has_av1_decoder() -> bool:
     except Exception:
         return False
 
+
 def _ensure_av1_decoder(sample_path: Optional[str] = None, max_frames: int = 3) -> Dict[str, object]:
     info: Dict[str, object] = {}
     try:
         import av
+
         info["pyav_version"] = getattr(av, "__version__", "?")
     except Exception as e:
         return {"error": f"PyAV not available: {e}"}
-
     try:
         av.CodecContext.create("av1", "r")
         info["decoder_check"] = "AV1 decoder present"
     except Exception as e:
         info["decoder_check"] = f"AV1 decoder NOT present: {e}"
         return info
-
     if sample_path and os.path.exists(sample_path):
         try:
             with av.open(sample_path) as cont:
@@ -304,6 +328,7 @@ def _ensure_av1_decoder(sample_path: Optional[str] = None, max_frames: int = 3) 
             info["sample_decode_error"] = str(e)
     return info
 
+
 # ─────────────── Utilidades STUN/TURN para webrtcbin ───────────────
 def _fmt_stun(url: str) -> str:
     url = url.strip()
@@ -312,6 +337,7 @@ def _fmt_stun(url: str) -> str:
     if url.startswith("stun:"):
         return "stun://" + url[5:]
     return url
+
 
 def _fmt_turn(turn_url: Optional[str], user: Optional[str], pwd: Optional[str]) -> Optional[str]:
     if not turn_url:
@@ -327,6 +353,7 @@ def _fmt_turn(turn_url: Optional[str], user: Optional[str], pwd: Optional[str]) 
     if user and pwd:
         auth = f"{user}:{pwd}@"
     return f"{scheme}://{auth}{hostpart}?transport=udp"
+
 
 # ─────────────── Sesión por peer (GStreamer WebRTC) ───────────────
 class GSTWebRTCSession:
@@ -348,7 +375,7 @@ class GSTWebRTCSession:
         # Per-task negotiated result DCs; keep legacy aliases for the first and for face
         self.result_dcs: Dict[str, GstWebRTC.WebRTCDataChannel] = {}
         self.results_dc: Optional[GstWebRTC.WebRTCDataChannel] = None  # alias of first adapter DC
-        self.face_dc: Optional[GstWebRTC.WebRTCDataChannel] = None     # convenience
+        self.face_dc: Optional[GstWebRTC.WebRTCDataChannel] = None  # convenience
         self.ctrl_dc: Optional[GstWebRTC.WebRTCDataChannel] = None
 
         # Create asyncio primitives on the right loop/thread
@@ -392,6 +419,7 @@ class GSTWebRTCSession:
             acks=0,
             ack_rtt_ms_avg=0.0,
         )
+
         # ── Appsink / processing visibility
         self._appsink_n = 0
         self._appsink_last_cb_ms = 0
@@ -407,13 +435,15 @@ class GSTWebRTCSession:
     # ─────────────── session-scope print helpers ───────────────
     def _info(self, msg: str):
         if PRINT_LOGS:
-            _log_print(f"Srv 0 {_ts()} INFO:   [WebRTC {self.sid}] {msg}", flush=True)
+            _log_print(f"Srv 0 {_ts()} INFO: [WebRTC {self.sid}] {msg}", flush=True)
+
     def _warn(self, msg: str):
         if PRINT_LOGS:
-            _log_print(f"Srv 0 {_ts()} WARN:   [WebRTC {self.sid}] {msg}", flush=True)
+            _log_print(f"Srv 0 {_ts()} WARN: [WebRTC {self.sid}] {msg}", flush=True)
+
     def _dbg(self, msg: str):
         if PRINT_LOGS:
-            _log_print(f"Srv 0 {_ts()} DEBUG:  [WebRTC {self.sid}] {msg}", flush=True)
+            _log_print(f"Srv 0 {_ts()} DEBUG: [WebRTC {self.sid}] {msg}", flush=True)
 
     def _buslog(self, level: str, src: str, text: str):
         line = f"{level} [{src}] {text}"
@@ -437,7 +467,7 @@ class GSTWebRTCSession:
             self.frame_q.put_nowait((frame_np, pts_ns))
         except asyncio.QueueFull:
             with contextlib.suppress(Exception):
-                _ = self.frame_q.get_nowait()   # drop oldest
+                _ = self.frame_q.get_nowait()  # drop oldest
             self.frame_q.put_nowait((frame_np, pts_ns))
             self._warn("Frame queue full; dropped oldest (keep-latest policy)")
 
@@ -449,6 +479,7 @@ class GSTWebRTCSession:
                 self._warn(f"PROBE {label}: no '{pad_name}' pad")
                 return
             counter = {"n": 0}
+
             def _probe(_pad, info):
                 if not info or not (info.type & Gst.PadProbeType.BUFFER):
                     return Gst.PadProbeReturn.OK
@@ -461,6 +492,7 @@ class GSTWebRTCSession:
                     caps_s = caps.to_string() if caps else "n/a"
                     self._dbg(f"PROBE {label} #{counter['n']}: pts={pts_ms:.1f}ms caps={caps_s}")
                 return Gst.PadProbeReturn.OK
+
             pad.add_probe(Gst.PadProbeType.BUFFER, _probe)
             self._dbg(f"PROBE installed on {label} ({elem.name}:{pad_name})")
         except Exception as e:
@@ -470,8 +502,10 @@ class GSTWebRTCSession:
     def _add_sink_probe(self, elem: Gst.Element, label: str, pad_name: str = "sink"):
         try:
             pad = elem.get_static_pad(pad_name)
-            if not pad: return
+            if not pad:
+                return
             counter = {"n": 0}
+
             def _probe(_pad, info):
                 if not info or not (info.type & Gst.PadProbeType.BUFFER):
                     return Gst.PadProbeReturn.OK
@@ -479,6 +513,7 @@ class GSTWebRTCSession:
                 if counter["n"] <= 5 or (counter["n"] % 30) == 0:
                     self._dbg(f"PROBE {label} (sink) #{counter['n']}")
                 return Gst.PadProbeReturn.OK
+
             pad.add_probe(Gst.PadProbeType.BUFFER, _probe)
         except Exception as e:
             self._warn(f"PROBE {label} (sink) install error: {e}")
@@ -486,9 +521,9 @@ class GSTWebRTCSession:
     # ───── Pipeline / webrtcbin setup ─────
     def _build(self):
         self.pipeline = Gst.Pipeline.new(None)
+
         self.webrtc = Gst.ElementFactory.make("webrtcbin", "webrtcbin")
         assert self.webrtc is not None, "webrtcbin plugin not available"
-
         self.webrtc.set_property("latency", 0)
 
         # STUN/TURN
@@ -528,8 +563,7 @@ class GSTWebRTCSession:
     def _precreate_negotiated_dcs(self):
         if not self.webrtc:
             return
-        if self.result_dcs or self.ctrl_dc:
-            # Already created
+        if self.result_dcs or self.ctrl_dc:  # Already created
             return
         assigned_ids: Set[int] = set()
         next_id = max(DC_RESULTS_ID, DC_CTRL_ID, DC_FACE_ID) + 1
@@ -544,14 +578,15 @@ class GSTWebRTCSession:
                 dcid = DC_FACE_ID if ad.name.lower() == "face" else next_id
                 if ad.name.lower() != "face":
                     next_id += 1
+
             if dcid in assigned_ids or dcid in (DC_CTRL_ID,):
                 # find next free
                 while next_id in assigned_ids or next_id in (DC_RESULTS_ID, DC_CTRL_ID, DC_FACE_ID):
                     next_id += 1
                 dcid = next_id
                 next_id += 1
-            assigned_ids.add(dcid)
 
+            assigned_ids.add(dcid)
             try:
                 opts = Gst.Structure.new_empty("application/webrtc-data-channel")
                 opts.set_value("ordered", False)
@@ -604,7 +639,7 @@ class GSTWebRTCSession:
                     old, new, _pending = msg.parse_state_changed()
                     if src is self.pipeline or new in (Gst.State.PAUSED, Gst.State.PLAYING):
                         self._dbg(f"STATE {src.name}: {old.value_nick}->{new.value_nick}")
-                        self._buslog("STATE", src.name, f"{old.value_nick}->{new.value_nick}")
+                    self._buslog("STATE", src.name, f"{old.value_nick}->{new.value_nick}")
         except Exception:
             pass
         return
@@ -624,8 +659,10 @@ class GSTWebRTCSession:
                     await self.process_task
         except Exception as e:
             self._warn(f"Error awaiting process_task cancel: {e}")
+
         if self.pipeline:
             self.pipeline.set_state(Gst.State.NULL)
+
         self.pipeline = None
         self.webrtc = None
         self.results_dc = None
@@ -637,11 +674,12 @@ class GSTWebRTCSession:
     # ───── Signaling (HTTP) helpers ─────
     async def accept_offer_and_create_answer(self, offer_sdp_text: str) -> str:
         assert self.webrtc is not None
-
         self._info("Accepting offer")
+
         ret, sdpmsg = GstSdp.sdp_message_new()
         if ret != GstSdp.SDPResult.OK:
             raise RuntimeError(f"sdp_message_new failed: {ret}")
+
         ret = GstSdp.sdp_message_parse_buffer(offer_sdp_text.encode("utf-8"), sdpmsg)
         if ret != GstSdp.SDPResult.OK:
             raise RuntimeError(f"Bad SDP offer: {ret}")
@@ -707,6 +745,7 @@ class GSTWebRTCSession:
     def _wire_results_dc(self, dc: GstWebRTC.WebRTCDataChannel | None):
         if not dc:
             return
+
         def on_open(ch):
             self._info(f"DataChannel '{ch.props.label}' open")
             if SEND_GREETING and (ch.props.label or "").startswith("results"):
@@ -724,6 +763,7 @@ class GSTWebRTCSession:
 
         def on_close(ch):
             self._warn(f"DataChannel '{ch.props.label}' closed")
+
         def on_error(ch, err):
             self._warn(f"DataChannel '{ch.props.label}' error: {err}")
 
@@ -731,6 +771,7 @@ class GSTWebRTCSession:
             if isinstance(msg, str) and msg.strip().upper() == "KF":
                 self._info(f"Received KF on '{ch.props.label}' (string) → will keyframe next send")
                 self.need_keyframe = True
+
         def _on_msg_bin(ch, data):
             try:
                 b = _as_bytes(data)
@@ -760,10 +801,13 @@ class GSTWebRTCSession:
     def _wire_ctrl_dc(self, dc: GstWebRTC.WebRTCDataChannel | None):
         if not dc:
             return
+
         def on_open(ch):
             self._info("DataChannel 'ctrl' open")
+
         def on_close(ch):
             self._warn("DataChannel 'ctrl' closed")
+
         def on_error(ch, err):
             self._warn(f"DataChannel 'ctrl' error: {err}")
 
@@ -883,6 +927,7 @@ class GSTWebRTCSession:
         # (Optional) quickly count incoming RTP buffers
         try:
             counter = {"n": 0}
+
             def _rtp_probe(_pad, info):
                 if not info or not (info.type & Gst.PadProbeType.BUFFER):
                     return Gst.PadProbeReturn.OK
@@ -890,6 +935,7 @@ class GSTWebRTCSession:
                 if counter["n"] <= 5 or (counter["n"] % 50) == 0:
                     self._dbg(f"RTP PAD buf #{counter['n']} on {pad.name} (encoding={enc})")
                 return Gst.PadProbeReturn.OK
+
             pad.add_probe(Gst.PadProbeType.BUFFER, _rtp_probe)
         except Exception as e:
             self._warn(f"Couldn't add RTP pad probe: {e}")
@@ -915,22 +961,20 @@ class GSTWebRTCSession:
         # Build ultra-low-latency chain: rtpjitterbuffer → leaky queue → decode
         try:
             jbuf = Gst.ElementFactory.make("rtpjitterbuffer", None)
-            q    = Gst.ElementFactory.make("queue", None)
+            q = Gst.ElementFactory.make("queue", None)
             if not jbuf or not q:
                 raise RuntimeError("Failed to create rtpjitterbuffer/queue")
 
             # Configure for low latency
             jbuf.set_property("latency", 0)
             jbuf.set_property("drop-on-late", True)
-            jbuf.set_property("do-lost", True)
-
-            # NEW ↓
+            jbuf.set_property("do-lost", True)  # NEW ↓
             # Do not wait for retransmissions; keep minimal reordering window.
             if jbuf.find_property("do-retransmission"):
                 jbuf.set_property("do-retransmission", False)
-            if jbuf.find_property("max-reorder"):          # packets
-                jbuf.set_property("max-reorder", 8)        # small but safe
-            if jbuf.find_property("max-dropout-time"):     # ms
+            if jbuf.find_property("max-reorder"):  # packets
+                jbuf.set_property("max-reorder", 8)  # small but safe
+            if jbuf.find_property("max-dropout-time"):  # ms
                 jbuf.set_property("max-dropout-time", 50)  # don’t wait long on timestamp jumps
 
             q.set_property("leaky", 2)  # downstream
@@ -985,9 +1029,9 @@ class GSTWebRTCSession:
                 warn=self._warn,
             )
             self._info("Appsink wired; waiting for decoded RGB frames…")
-
             if not self.process_task:
                 self.loop.call_soon_threadsafe(self._start_processing_task)
+
         except Exception as e:
             self._warn(f"Failed to attach decode chain via jbuf/queue: {e}")
             _fallback_direct_attach()
@@ -1000,11 +1044,11 @@ class GSTWebRTCSession:
             sample: Gst.Sample = sink.emit("pull-sample")
             buf: Gst.Buffer = sample.get_buffer()
             caps: Gst.Caps = sample.get_caps()
+
             s = caps.get_structure(0)
             w = int(s.get_value("width"))
             h = int(s.get_value("height"))
             fmt = s.get_string("format") or "?"
-
             caps_sig = f"{w}x{h}/{fmt}"
             if caps_sig != self._appsink_caps_sig:
                 self._appsink_caps_sig = caps_sig
@@ -1022,13 +1066,11 @@ class GSTWebRTCSession:
 
             dcb_ms = (now_ms - self._appsink_last_cb_ms) if self._appsink_last_cb_ms else 0
             self._appsink_last_cb_ms = now_ms
-
             pts_ms = (pts_ns / 1_000_000.0) if pts_ns >= 0 else -1.0
             dpts_ms = None
             if self._appsink_last_pts_ns is not None and pts_ns >= 0:
                 dpts_ms = (pts_ns - self._appsink_last_pts_ns) / 1_000_000.0
             self._appsink_last_pts_ns = pts_ns
-
             self._appsink_n += 1
 
             if FRAME_GAP_WARN_MS > 0 and dcb_ms and dcb_ms > FRAME_GAP_WARN_MS:
@@ -1073,8 +1115,7 @@ class GSTWebRTCSession:
 
             self._proc_n += 1
             if self._proc_n <= 5 or (self._proc_n % 30) == 0:
-                dc_state = (self.results_dc.get_property("ready-state")
-                            if self.results_dc else None)
+                dc_state = (self.results_dc.get_property("ready-state") if self.results_dc else None)
                 self._dbg(f"PROCESS sample #{self._proc_n}: dequeued; dc_state={dc_state} q={self.frame_q.qsize()}")
 
             ts_ms = int(time.monotonic() * 1000)
@@ -1112,8 +1153,11 @@ class GSTWebRTCSession:
                     # Keyframe if first time or number of instances changed
                     kf = prev is None or (prev is not None and len(prev) != len(pts))
                     self.seq = (self.seq + 1) & 0xFFFF
-                    packet = pack_pose_frame_delta(prev, pts, w0, h0, keyframe=kf, seq=self.seq, ver=2) \
-                             if "pack_pose_frame_delta" in globals() else pack_pose_frame(w0, h0, pts)
+                    packet = (
+                        pack_pose_frame_delta(prev, pts, w0, h0, keyframe=kf, seq=self.seq, ver=2)
+                        if "pack_pose_frame_delta" in globals()
+                        else pack_pose_frame(w0, h0, pts)
+                    )
                     return ad.name, (w0, h0), pts, packet, kf
 
                 t0 = time.perf_counter()
@@ -1138,11 +1182,12 @@ class GSTWebRTCSession:
 
                 external_kf = self.need_keyframe
                 self.need_keyframe = False
-                gap_key     = (ts_ms - self.last_sent_ms) > 250
-                stale_key   = (ts_ms - self.last_key_ms) >= 300
+                gap_key = (ts_ms - self.last_sent_ms) > 250
+                stale_key = (ts_ms - self.last_key_ms) >= 300
                 nochange_kf = (ts_ms - self.last_change_ms) >= 400
                 first_move_after_idle = changed and (self.idle_start_ms is not None)
                 heartbeat_abs = ABSOLUTE_INTERVAL_MS > 0 and (ts_ms - self.last_abs_ms) >= ABSOLUTE_INTERVAL_MS
+
                 force_kf = (external_kf or gap_key or stale_key or nochange_kf or first_move_after_idle or heartbeat_abs)
 
                 # Send per-adapter on its specific DC (skip if congested)
@@ -1171,10 +1216,12 @@ class GSTWebRTCSession:
                             gstbuf = Gst.Buffer.new_allocate(None, len(packet), None)
                             gstbuf.fill(0, packet)
                             dc.emit("send-data", gstbuf)
+
                         sent_any = True
                         self._prev_pts[name] = pts
+
                         self.stats["frames_sent"] = int(self.stats["frames_sent"]) + 1
-                        self.stats["bytes_sent"]  = int(self.stats["bytes_sent"]) + len(packet)
+                        self.stats["bytes_sent"] = int(self.stats["bytes_sent"]) + len(packet)
                         if kf_local:
                             self.stats["kf_sent"] = int(self.stats["kf_sent"]) + 1
                         else:
@@ -1187,7 +1234,6 @@ class GSTWebRTCSession:
                             f"pts-per-obj={[len(p) for p in pts]} "
                             f"infer_ms(last/avg)={self.stats['infer_ms_last']:.2f}/{self.stats['infer_ms_avg']:.2f}"
                         )
-
                     except Exception as e:
                         self._warn(f"Send error on DC '{name}': {e}")
                         continue
@@ -1202,7 +1248,6 @@ class GSTWebRTCSession:
                     if RESULTS_REQUIRE_ACK and self.results_dc:
                         self._awaiting_ack[self.seq] = ts_ms
                         self._dbg(f"Awaiting ACK for seq={self.seq}")
-
                 else:
                     self._dbg("Skip send: all DCs closed or buffered-amount high")
 
@@ -1215,14 +1260,16 @@ class GSTWebRTCSession:
         try:
             pipe_state = None
             conn_state = None
-            ice_state  = None
-            sig_state  = None
+            ice_state = None
+            sig_state = None
+
             if self.pipeline:
                 try:
                     st = self.pipeline.get_state(0.0)[1]
                     pipe_state = st.value_nick if st is not None else None
                 except Exception:
                     pipe_state = None
+
             if self.webrtc:
                 try:
                     conn_state = self.webrtc.get_property("connection-state").value_nick
@@ -1236,10 +1283,9 @@ class GSTWebRTCSession:
                     sig_state = self.webrtc.get_property("signaling-state").value_nick
                 except Exception:
                     pass
-            res_state = (self.results_dc.get_property("ready-state").value_nick
-                         if self.results_dc else None)
-            ctrl_state = (self.ctrl_dc.get_property("ready-state").value_nick
-                          if self.ctrl_dc else None)
+
+            res_state = (self.results_dc.get_property("ready-state").value_nick if self.results_dc else None)
+            ctrl_state = (self.ctrl_dc.get_property("ready-state").value_nick if self.ctrl_dc else None)
 
             factories = {
                 "webrtcbin": _has_factory("webrtcbin"),
@@ -1275,11 +1321,11 @@ class GSTWebRTCSession:
                 "bus_tail": list(self._bus_tail),
                 "factories": factories,
                 "adapters": [a.name for a in self.adapters],
-                "result_dcs": {k: (v.get_property("ready-state").value_nick if v else None)
-                               for k, v in self.result_dcs.items()},
+                "result_dcs": {k: (v.get_property("ready-state").value_nick if v else None) for k, v in self.result_dcs.items()},
             }
         except Exception as e:
             return {"snapshot_error": str(e)}
+
 
 # ─────────────── Constructor del Blueprint WebRTC (Sanic) ───────────────
 def build_webrtc_blueprint(
@@ -1294,7 +1340,6 @@ def build_webrtc_blueprint(
     default_task: str = "pose",
     url_prefix: str = "",
 ) -> Blueprint:
-
     _ensure_gst_mainloop()
 
     bp = Blueprint("webrtc", url_prefix=url_prefix)
@@ -1316,6 +1361,7 @@ def build_webrtc_blueprint(
     async def _mute_sanic_logs(app, loop):
         if not PRINT_LOGS:
             import logging
+
             for name in ("sanic.root", "sanic.error", "sanic.access", "sanic.server"):
                 try:
                     logging.getLogger(name).disabled = True
@@ -1341,7 +1387,6 @@ def build_webrtc_blueprint(
             return response.json({"error": "Type must be 'offer'."}, status=400)
 
         sdp_head = (params.get("sdp") or "")[:512]
-
         loop = asyncio.get_event_loop()
 
         # Select adapters: multi-task or legacy single-task fallback
@@ -1359,8 +1404,7 @@ def build_webrtc_blueprint(
             else:
                 key = str(params.get("task") or default_task).lower()
                 if key not in adapters:
-                    return response.json({"error": f"unknown task '{key}'",
-                                          "allowed": list(adapters)}, status=400)
+                    return response.json({"error": f"unknown task '{key}'", "allowed": list(adapters)}, status=400)
                 selected_adapters = [adapters[key]]
         else:
             # Build a single default adapter from legacy hooks
@@ -1387,14 +1431,17 @@ def build_webrtc_blueprint(
                 snap = sess.snapshot()
             except Exception as _e2:
                 snap = {"snapshot_error": str(_e2)}
+
             _gwarn(f"[WebRTC {sess.sid}] Failed to create answer: {e!r}")
             _gwarn(f"[WebRTC {sess.sid}] Traceback:\n{exc_text}")
             _gwarn(f"[WebRTC {sess.sid}] Snapshot: {snap}")
+
             try:
                 await sess.stop()
             except Exception:
                 pass
             _sessions.discard(sess)
+
             return response.json({
                 "error": "Failed to create answer",
                 "exception": repr(e),

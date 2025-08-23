@@ -978,6 +978,10 @@ class GSTWebRTCSession:
                 jbuf.set_property("max-reorder", 8)  # small but safe
             if jbuf.find_property("max-dropout-time"):  # ms
                 jbuf.set_property("max-dropout-time", 50)  # don’t wait long on timestamp jumps
+            if jbuf.find_property("rtx-retry-time"):
+                jbuf.set_property("rtx-retry-time", 0)  # don't wait for RTX
+            if jbuf.find_property("drop-duplicates"):
+                jbuf.set_property("drop-duplicates", True)
 
             q.set_property("leaky", 2)  # downstream
             q.set_property("max-size-buffers", 1)

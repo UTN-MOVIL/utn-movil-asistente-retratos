@@ -20,7 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]  # …/funcionalidades_validador_retr
 sys.path.insert(0, str(ROOT))
 
 # --- Facial landmarks (tu módulo existente) ---
-from modulos.puntos_faciales import (
+from modules.puntos_faciales import (
     AppConfig as FaceConfig,
     DEFAULT_MODEL_URLS as FACE_MODEL_URLS,
     ensure_file as ensure_face_file,
@@ -31,7 +31,7 @@ from modulos.puntos_faciales import (
 )
 
 # --- Pose / esqueleto (nuevo) ---
-from modulos.esqueleto import (
+from modules.esqueleto import (
     AppConfig as PoseConfig,
     DEFAULT_MODEL_URLS as POSE_MODEL_URLS,
     ensure_file as ensure_pose_file,

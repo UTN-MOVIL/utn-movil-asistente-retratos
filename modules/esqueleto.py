@@ -1,4 +1,4 @@
-# modulos/esqueleto.py
+# modules/esqueleto.py
 
 from __future__ import annotations
 import os, sys, time, tempfile, urllib.request, argparse, platform

@@ -17,7 +17,7 @@ from mediapipe.tasks.python import vision as mp_vision
 
 # ─────────────── Tus módulos propios ───────────────
 # Pose (estilo "puntos_faciales" con MediaPipe Tasks)
-from modulos.esqueleto import (
+from modules.esqueleto import (
     AppConfig as PoseAppConfig,
     LandmarkerFactory as PoseLandmarkerFactory,
     ensure_file as ensure_pose_model,
@@ -26,7 +26,7 @@ from modulos.esqueleto import (
 )
 
 # Face (tu módulo existente “puntos_faciales”)
-from modulos.puntos_faciales import (
+from modules.puntos_faciales import (
     AppConfig as FaceAppConfig,
     LandmarkerFactory as FaceLandmarkerFactory,
     ensure_file as ensure_face_model,

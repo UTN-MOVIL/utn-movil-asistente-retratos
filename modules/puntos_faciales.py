@@ -1,4 +1,4 @@
-# modulos/puntos_faciales.py
+# modules/puntos_faciales.py
 # Reqs (ejemplo): pip install mediapipe opencv-python
 
 from __future__ import annotations

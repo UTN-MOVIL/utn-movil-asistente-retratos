@@ -50,11 +50,34 @@ async def process_frames(session: "GSTWebRTCSession"):
     while True:
         try:
             (payload, w, h), pts_ns = await self.frame_q.get()
-            frame = np.frombuffer(payload, dtype=np.uint8).reshape((h, w, 3))
+
+            # Accept RGBA as the default; tolerate RGB if upstream still sends it.
+            # We infer the channel count from payload length to avoid mismatches.
+            wh = int(w) * int(h)
+            nbytes = len(payload)
+            if nbytes == wh * 4:
+                channels = 4  # RGBA
+            elif nbytes == wh * 3:
+                channels = 3  # RGB (fallback/compat)
+            else:
+                # Last-resort inference (e.g., if there’s padding) — will raise on reshape if invalid.
+                channels = nbytes // wh
+                if channels not in (3, 4):
+                    raise ValueError(
+                        f"Unexpected payload size={nbytes} for {w}x{h}; "
+                        f"cannot infer channels (wanted 3 or 4)."
+                    )
+
+            frame = np.frombuffer(payload, dtype=np.uint8).reshape((h, w, channels))
+
+            # Optional debug on first few frames to verify channel mode
+            if self._proc_n < 5:
+                self._dbg(f"PROCESS reshape: {w}x{h}x{channels} (bytes={nbytes})")
+
         except asyncio.CancelledError:
             break
         except Exception as e:
-            self._warn(f"frame_q.get error: {e}")
+            self._warn(f"frame_q.get/reshape error: {e}")
             continue
 
         self._proc_n += 1
@@ -80,7 +103,13 @@ async def process_frames(session: "GSTWebRTCSession"):
 
         try:
             async def run_one(ad):
-                mp_img = ad.make_mp_image(frame)
+                # If adapters provide a specialized RGBA constructor, prefer it.
+                make_rgba = getattr(ad, "make_mp_image_rgba", None)
+                if frame.shape[2] == 4 and callable(make_rgba):
+                    mp_img = make_rgba(frame)  # RGBA path
+                else:
+                    mp_img = ad.make_mp_image(frame)  # existing path (should accept 3 or 4 channels)
+
                 if POSE_USE_VIDEO:
                     if inspect.iscoroutinefunction(ad.detect_video):
                         res = await ad.detect_video(mp_img, ts_ms)
@@ -91,6 +120,8 @@ async def process_frames(session: "GSTWebRTCSession"):
                         res = await ad.detect_image(mp_img)
                     else:
                         res = await asyncio.to_thread(ad.detect_image, mp_img)
+
+                # Adapters should only need HxW; passing the whole shape (HxWxC) remains OK
                 w0, h0, pts = ad.points_from_result(res, frame.shape)
                 prev = self._prev_pts.get(ad.name)
                 kf = prev is None or (prev is not None and len(prev) != len(pts))

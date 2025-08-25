@@ -230,6 +230,47 @@ def _make_decoder_for(
     return dec
 
 
+# ──────────────────────── (New) GPU RGB download helper ───────────────────────
+
+def _factory_name(elem: Gst.Element | None) -> str:
+    try:
+        return (elem.get_factory().get_name() or "").lower()
+    except Exception:
+        return ""
+
+def _make_gpu_rgb_download_chain(upstream_is_va: bool, dbg=None):
+    """
+    Try to use VA-API postproc to convert to RGBA on the GPU and download to SystemMemory.
+    If upstream is not VA (e.g., software/NV), insert 'vaupload' first (when available).
+    Returns a list of elements [vaupload? , vapostproc/vaapipostproc , capsfilter] or None.
+    """
+    pp_name = ("vapostproc" if _has_factory("vapostproc")
+               else ("vaapipostproc" if _has_factory("vaapipostproc") else None))
+    if not pp_name:
+        return None
+
+    elems = []
+
+    # If using the newer 'vapostproc' pipeline and upstream isn't VA, help it with 'vaupload'
+    if not upstream_is_va and _has_factory("vaupload"):
+        elems.append(Gst.ElementFactory.make("vaupload", None))
+
+    post = Gst.ElementFactory.make(pp_name, None)
+    if not post:
+        return None
+
+    caps_rgba_sys = Gst.ElementFactory.make("capsfilter", "caps_rgba_sysmem")
+    caps_rgba_sys.set_property(
+        "caps", Gst.Caps.from_string("video/x-raw,format=RGBA,memory=SystemMemory")
+    )
+
+    elems += [post, caps_rgba_sys]
+    if dbg:
+        dbg(f"GPU RGB chain via {pp_name} (→ RGBA SystemMemory)")
+    return elems
+
+
+# (Kept for reference; no longer used in the new path)
 def _maybe_postproc_after(
     dec: Gst.Element,
     dbg: Callable[[str], None] | None = None
@@ -247,7 +288,6 @@ def _maybe_postproc_after(
     except Exception:
         pass
 
-    # Broaden detection to cover vah264/265 and NV variants
     use_va = name.startswith("va") or "vaapi" in name or name.startswith("vah")
     use_nv = name.startswith("nv") or "nvh" in name
 
@@ -260,7 +300,6 @@ def _maybe_postproc_after(
             if dbg:
                 dbg(f"Inserted VA-API postproc: {pp_name} (GPU surfaces → CPU)")
         caps_to_sys = Gst.ElementFactory.make("capsfilter", "caps_to_sysmem")
-        # Download VA surfaces to system memory with a defined format
         caps_to_sys.set_property(
             "caps",
             Gst.Caps.from_string("video/x-raw,format=NV12,memory:SystemMemory")
@@ -275,7 +314,6 @@ def _maybe_postproc_after(
             if dbg:
                 dbg(f"Inserted NV postproc: {pp_name} (NVMM → CPU)")
         caps_to_sys = Gst.ElementFactory.make("capsfilter", "caps_to_sysmem")
-        # Dropping NVMM memory type is enough; format can be negotiated
         caps_to_sys.set_property("caps", Gst.Caps.from_string("video/x-raw"))
         if dbg:
             dbg("Forcing download of NVMM memory: caps=video/x-raw")
@@ -307,17 +345,22 @@ def build_rtp_video_decode_bin(
     if depay is None or dec is None:
         raise RuntimeError(f"No depay/decoder available for encoding '{encoding_name}'")
 
-    postproc, caps_to_sys = _maybe_postproc_after(dec, dbg=dbg)
+    # New: prefer GPU color convert + download to RGBA SystemMemory via VA
+    dec_is_va = _is_va_factory(_factory_name(dec))
+    gpu_rgb_chain = _make_gpu_rgb_download_chain(dec_is_va, dbg=dbg)
 
-    swcvt = Gst.ElementFactory.make("videoconvert", "swcvt")  # ensures CPU colorspace
-    # Enable QoS on the CPU converter (optional but recommended)
-    with contextlib.suppress(Exception):
-        swcvt.set_property("qos", True)
-
-    caps_rgb = None
-    if want_rgb:
-        caps_rgb = Gst.ElementFactory.make("capsfilter", "caps_rgb")
-        caps_rgb.set_property("caps", Gst.Caps.from_string("video/x-raw,format=RGB"))
+    # Fallback CPU path
+    swcvt = caps_rgb = None
+    if gpu_rgb_chain is None:
+        swcvt = Gst.ElementFactory.make("videoconvert", "swcvt")
+        with contextlib.suppress(Exception):
+            swcvt.set_property("qos", True)
+        if want_rgb:
+            caps_rgb = Gst.ElementFactory.make("capsfilter", "caps_rgb")
+            # Keep consistency with GPU path (RGBA). Change to RGB if you prefer 3ch.
+            caps_rgb.set_property("caps", Gst.Caps.from_string("video/x-raw,format=RGBA"))
+        if dbg:
+            dbg("GPU RGB chain not available → falling back to CPU videoconvert")
 
     # Create the leaky queue right before appsink
     q2 = Gst.ElementFactory.make("queue", "leaky_to_sink")
@@ -338,14 +381,15 @@ def build_rtp_video_decode_bin(
     if parse:
         chain.append(parse)
     chain.append(dec)
-    if postproc:
-        chain.append(postproc)
-    if caps_to_sys:
-        chain.append(caps_to_sys)
-    if swcvt:
-        chain.append(swcvt)
-    if caps_rgb:
-        chain.append(caps_rgb)
+
+    if gpu_rgb_chain:
+        chain.extend(gpu_rgb_chain)
+    else:
+        if swcvt:
+            chain.append(swcvt)
+        if caps_rgb:
+            chain.append(caps_rgb)
+
     chain.append(q2)
     chain.append(appsink)
 
@@ -367,9 +411,8 @@ def build_rtp_video_decode_bin(
         try:
             dec_name = dec.get_factory().get_name()
             dep_name = depay.get_factory().get_name()
-            rgb_flag = bool(caps_rgb)
+            rgb_flag = True  # we always target RGBA for appsink in this build
             dbg(f"Decode bin ready: depay='{dep_name}', decoder='{dec_name}', rgb={rgb_flag}")
-            # Extra hint: if VA-API/NV decoder chosen, we're on GPU decode path
             if _is_va_factory(dec_name):
                 dbg("GPU decode path active (VA-API). If using AMD, this is your AMD GPU via VA-API.")
             elif _is_nv_factory(dec_name):

@@ -549,8 +549,10 @@ class GSTWebRTCSession:
 
         # Watch pipeline bus
         bus = self.pipeline.get_bus()
-        bus.add_signal_watch()
-        bus.connect("message", self._on_bus_message)
+        if PRINT_LOGS:
+            bus.add_signal_watch()
+            bus.connect("message", self._on_bus_message)
+        self._info("Pipeline constructed")
 
         # IMPORTANT: Do NOT pre-create negotiated DCs here anymore.
         # We'll create them *after* set-remote-description and *before* create-answer.

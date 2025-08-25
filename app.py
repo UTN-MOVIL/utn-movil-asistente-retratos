@@ -271,8 +271,7 @@ def _faces_px_from_result(result, img_shape) -> Tuple[int, int, List[List[Tuple[
     return w, h, faces_px
 
 def _make_mp_image(rgb_np: np.ndarray):
-    # rgb_np: (H,W,3) uint8
-    return mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_np)
+    return mp.Image(image_format=mp.ImageFormat.SRGBA, data=rgb_np)
 
 async def _detect_pose_image(mp_image: mp.Image):
     global pose_landmarker_image, pose_lock

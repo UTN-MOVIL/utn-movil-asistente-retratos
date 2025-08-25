@@ -251,8 +251,23 @@ def pack_pose_frame_delta(
     seq: Optional[int] = None,
     ver: int = 2,
 ) -> bytes:
+    """
+    Build a compact delta packet (PD). When nothing changed and ABSOLUTE_INTERVAL_MS<=0,
+    return b"" so callers can skip sending altogether.
+    """
     absolute_needed = (prev is None) or (len(prev) != len(curr))
     keyframe = keyframe or absolute_needed
+
+    # ── NEW: short-circuit "no change" optimization
+    if not keyframe and prev is not None and len(prev) == len(curr):
+        any_change = False
+        for p, cpose in enumerate(curr):
+            if cpose != prev[p]:  # quick list/tuple compare; cheap and exact
+                any_change = True
+                break
+        if not any_change and ABSOLUTE_INTERVAL_MS <= 0:
+            return b""  # signal "skip send"
+
     out = bytearray(b"PD")
     out += bytes([ver & 0xFF])
     out += bytes([1 if keyframe else 0])
@@ -260,6 +275,7 @@ def pack_pose_frame_delta(
         out += struct.pack("<H", (seq or 0) & 0xFFFF)
     out += struct.pack("<H", min(len(curr), 0xFFFF))
     out += struct.pack("<HH", image_w, image_h)
+
     if keyframe:
         for pts in curr:
             out += struct.pack("<H", min(len(pts), 0xFFFF))
@@ -268,6 +284,7 @@ def pack_pose_frame_delta(
                     "<HH", max(0, min(65535, x)), max(0, min(65535, y)),
                 )
         return bytes(out)
+
     for p, cpose in enumerate(curr):
         npts = len(cpose)
         out += struct.pack("<H", min(npts, 0xFFFF))

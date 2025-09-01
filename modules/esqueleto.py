@@ -1,7 +1,7 @@
 # modules/esqueleto.py
 
 from __future__ import annotations
-import os, sys, time, tempfile, urllib.request, argparse, platform
+import os, sys, time, tempfile, urllib.request, argparse, platform, math
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, Optional
@@ -35,11 +35,11 @@ class AppConfig:
     window_title: str = "Pose Landmarker (GPU si disponible)"
     draw_landmarks: bool = True
     max_poses: int = 1
-    min_pose_detection_confidence: float = 0.5
+    min_pose_detection_confidence: float = 0.7
     running_mode: vision.RunningMode = vision.RunningMode.VIDEO  # IMAGE | VIDEO | LIVE_STREAM
 
     # NEW (optional): request more eager tracking when using RunningMode.VIDEO
-    min_tracking_confidence: Optional[float] = None  # ← added
+    min_tracking_confidence: Optional[float] = 0.7  # ← added
 
 
 # ─────────────────────── Utilidades de modelo ───────────────────────
@@ -203,7 +203,7 @@ class PerfMeter:
             avg_e2e = self.sum_e2e_ms_win / self.frames_since
             self.last_snapshot = PerfSnapshot(fps, avg_inf, avg_e2e)
 
-            print(f"FPS: {fps:.1f} | infer(avg): {avg_inf:.1f} ms | e2e(avg): {avg_e2e:.1f} ms")
+            #print(f"FPS: {fps:.1f} | infer(avg): {avg_inf:.1f} ms | e2e(avg): {avg_e2e:.1f} ms")
 
             # reset ventana 1s
             self.frames_since = 0
@@ -253,6 +253,35 @@ class PerfMeter:
 
 # ─────────────────────── Dibujo y overlay ───────────────────────
 
+def calcular_y_mostrar_angulo_hombros(frame_bgr, pose_landmarks, frame_width, frame_height):
+    """Calcula y dibuja el ángulo de inclinación de los hombros en el frame."""
+    # MediaPipe Pose Landmarker landmark indices
+    LEFT_SHOULDER = 11
+    RIGHT_SHOULDER = 12
+
+    # Asegúrate de que los landmarks necesarios están presentes
+    if len(pose_landmarks) > RIGHT_SHOULDER:
+        # Obtiene los objetos landmark para los hombros
+        lm_izquierdo = pose_landmarks[LEFT_SHOULDER]
+        lm_derecho = pose_landmarks[RIGHT_SHOULDER]
+
+        # Extrae las coordenadas (x, y) en píxeles
+        hombro_izquierdo = (int(lm_izquierdo.x * frame_width), int(lm_izquierdo.y * frame_height))
+        hombro_derecho = (int(lm_derecho.x * frame_width), int(lm_derecho.y * frame_height))
+
+        # Calcula la diferencia en las coordenadas
+        dy = hombro_derecho[1] - hombro_izquierdo[1]
+        dx = hombro_derecho[0] - hombro_izquierdo[0]
+
+        # Calcula el ángulo en grados
+        angle = math.degrees(math.atan2(dy, dx))
+
+        # Dibuja el ángulo en la pantalla
+        # Puedes ajustar la posición (x, y) del texto según necesites
+        texto_angulo = f"Inclinacion: {angle:.1f} grados"
+        cv2.putText(frame_bgr, texto_angulo, (hombro_izquierdo[0], hombro_izquierdo[1] - 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2, cv2.LINE_AA)
+
 def draw_pose_skeleton_bgr(frame_bgr, result) -> None:
     """Dibuja el esqueleto (POSE_CONNECTIONS) de todas las poses detectadas."""
     if not result or not getattr(result, "pose_landmarks", None):
@@ -262,6 +291,10 @@ def draw_pose_skeleton_bgr(frame_bgr, result) -> None:
     connections = mp.solutions.pose.POSE_CONNECTIONS  # pares de índices
 
     for lms in result.pose_landmarks:  # lista de poses
+        # ▼▼▼ AÑADE ESTA LÍNEA ▼▼▼
+        calcular_y_mostrar_angulo_hombros(frame_bgr, lms, w, h)
+        # ▲▲▲ FIN DE LA LÍNEA AÑADIDA ▲▲▲
+
         pts = [(int(lm.x * w), int(lm.y * h)) for lm in lms]
 
         # Dibujar conexiones (líneas)

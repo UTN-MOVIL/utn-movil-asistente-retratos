@@ -93,7 +93,7 @@ async def _setup(app, loop):
             delegate_preference="gpu",
             running_mode=mp_vision.RunningMode.VIDEO,  # WebRTC streaming
             max_poses=1,
-            min_pose_detection_confidence=0.3,         # más laxo
+            min_pose_detection_confidence=0.5,     
             min_tracking_confidence=0.2,
         )
         pose_landmarker_video = PoseLandmarkerFactory(pose_cfg_video).create_with_fallback()
@@ -114,7 +114,7 @@ async def _setup(app, loop):
         delegate_preference="gpu",
         running_mode=mp_vision.RunningMode.IMAGE,
         max_faces=1,
-        min_face_detection_confidence=0.5,
+        min_face_detection_confidence=0.7,
     )
     face_landmarker = FaceLandmarkerFactory(face_cfg).create_with_fallback()
     logger.info("FaceLandmarker (IMAGE) inicializado.")

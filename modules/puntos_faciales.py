@@ -36,7 +36,7 @@ class AppConfig:
     window_title: str = "Face Landmarker (GPU si disponible)"
     draw_landmarks: bool = True
     max_faces: int = 1
-    min_face_detection_confidence: float = 0.5
+    min_face_detection_confidence: float = 0.7
     running_mode: vision.RunningMode = vision.RunningMode.VIDEO  # IMAGE | VIDEO | LIVE_STREAM
 
 

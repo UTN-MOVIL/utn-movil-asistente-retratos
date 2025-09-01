@@ -227,17 +227,50 @@ def _has_factory(name: str) -> bool:
     return Gst.ElementFactory.find(name) is not None
 
 
+# ───────── Cuantización fija (px * 2^shift) ─────────
+# 0→1x (entero), 1→1/2 px, 2→1/4 px … (limitado a 0..3)
+POSE_Q_SHIFT = int(os.getenv("POSE_Q_SHIFT", "1"))
+POSE_Q_SHIFT = max(0, min(POSE_Q_SHIFT, 3))
+POSE_Q_SCALE = 1 << POSE_Q_SHIFT
+
+
+def _ver_byte_with_scale(base_ver: int = 2) -> int:
+    """
+    Byte de versión con la escala en los 2 bits bajos.
+    bits[1:0] = shift (0→1x,1→2x,2→4x)
+    """
+    return (base_ver & 0xFC) | (POSE_Q_SHIFT & 0x03)
+
+
+def _q16_px(v: float | int) -> int:
+    """Convierte px reales a entero uint16 en unidades (px * 2^shift)."""
+    return max(0, min(65535, int(round(float(v) * POSE_Q_SCALE))))  # clamp
+
+
+def _quantize_poses(poses: List[List[Tuple[int | float, int | float]]]) -> List[List[Tuple[int, int]]]:
+    return [[(_q16_px(x), _q16_px(y)) for (x, y) in pts] for pts in poses]
+
+
 # ─────────────── Empaquetadores binarios (PO/PD) ───────────────
 def pack_pose_frame(image_w: int, image_h: int, poses: List[List[Tuple[int, int]]]) -> bytes:
+    """
+    PO absoluto con W/H y coordenadas cuantizados por 2^POSE_Q_SHIFT.
+    ver: bits[1:0] = shift (0→1x,1→2x,2→4x)
+    """
+    ver = _ver_byte_with_scale(2)
+    wq = _q16_px(image_w)
+    hq = _q16_px(image_h)
+    qposes = _quantize_poses(poses)
+
     out = bytearray()
     out += b"PO"
-    out += bytes([0])  # version
-    out += struct.pack("<H", min(len(poses), 0xFFFF))
-    out += struct.pack("<HH", image_w, image_h)
-    for pts in poses:
+    out += bytes([ver])  # version con escala
+    out += struct.pack("<H", min(len(qposes), 0xFFFF))
+    out += struct.pack("<HH", wq, hq)
+    for pts in qposes:
         out += struct.pack("<H", min(len(pts), 0xFFFF))
-        for (x, y) in pts:
-            out += struct.pack("<HH", max(0, min(65535, x)), max(0, min(65535, y)))
+        for (xq, yq) in pts:
+            out += struct.pack("<HH", xq, yq)
     return bytes(out)
 
 
@@ -252,54 +285,100 @@ def pack_pose_frame_delta(
     ver: int = 2,
 ) -> bytes:
     """
-    Build a compact delta packet (PD). When nothing changed and ABSOLUTE_INTERVAL_MS<=0,
-    return b"" so callers can skip sending altogether.
+    PD con cuantización fija (px * 2^POSE_Q_SHIFT).
+    Envía KF si:
+      - no hay prev compatible, o contar/longitud difiere, o
+      - algún delta en unidades cuantizadas excede int8 (±127).
+    Optimización "no change": si no cambió nada y ABSOLUTE_INTERVAL_MS<=0 → b"".
     """
-    absolute_needed = (prev is None) or (len(prev) != len(curr))
+    ver_byte = _ver_byte_with_scale(ver)
+    wq = _q16_px(image_w)
+    hq = _q16_px(image_h)
+
+    qcurr = _quantize_poses(curr)
+    qprev = _quantize_poses(prev) if prev is not None else None
+
+    # ¿Necesita absoluto?
+    absolute_needed = (
+        qprev is None
+        or (len(qprev) != len(qcurr))
+        or any(len(qprev[p]) != len(qcurr[p]) for p in range(len(qcurr)))
+    )
     keyframe = keyframe or absolute_needed
 
-    # ── NEW: short-circuit "no change" optimization
-    if not keyframe and prev is not None and len(prev) == len(curr):
-        any_change = False
-        for p, cpose in enumerate(curr):
-            if cpose != prev[p]:  # quick list/tuple compare; cheap and exact
-                any_change = True
-                break
-        if not any_change and ABSOLUTE_INTERVAL_MS <= 0:
-            return b""  # signal "skip send"
+    # "No change" (comparando cuantizados) → permite saltarse envío
+    if not keyframe and qprev is not None and len(qprev) == len(qcurr):
+        any_change = any(qcurr[p] != qprev[p] for p in range(len(qcurr)))
+        if (not any_change) and ABSOLUTE_INTERVAL_MS <= 0:
+            return b""
 
+    # Cabecera PD
     out = bytearray(b"PD")
-    out += bytes([ver & 0xFF])
+    out += bytes([ver_byte])
     out += bytes([1 if keyframe else 0])
     if ver >= 1:
         out += struct.pack("<H", (seq or 0) & 0xFFFF)
-    out += struct.pack("<H", min(len(curr), 0xFFFF))
-    out += struct.pack("<HH", image_w, image_h)
+    out += struct.pack("<H", min(len(qcurr), 0xFFFF))
+    out += struct.pack("<HH", wq, hq)
 
+    # KF: escribir absolutos cuantizados
     if keyframe:
-        for pts in curr:
+        for pts in qcurr:
             out += struct.pack("<H", min(len(pts), 0xFFFF))
-            for (x, y) in pts:
-                out += struct.pack(
-                    "<HH", max(0, min(65535, x)), max(0, min(65535, y)),
-                )
+            for (xq, yq) in pts:
+                out += struct.pack("<HH", xq, yq)
         return bytes(out)
 
-    for p, cpose in enumerate(curr):
+    # Delta: máscara + int8 (en unidades cuantizadas)
+    # Si algún delta excede ±127 → rehacer como KF
+    large_move_detected = False
+
+    # Primero calculamos máscaras y deltas para detectar overflow
+    masks: List[Tuple[int, int]] = []  # (npts, mask_bytes_len) solo para tamaño
+    deltas_per_pose: List[List[Tuple[int, int]]] = []
+
+    for p, cpose in enumerate(qcurr):
+        npts = len(cpose)
+        pmask = 0
+        pose_deltas: List[Tuple[int, int]] = []
+
+        for i, (xq, yq) in enumerate(cpose):
+            pxq, pyq = qprev[p][i]
+            if xq != pxq or yq != pyq:
+                dx = xq - pxq
+                dy = yq - pyq
+                if dx < -127 or dx > 127 or dy < -127 or dy > 127:
+                    large_move_detected = True
+                pmask |= (1 << i)
+                pose_deltas.append((dx, dy))
+            else:
+                pose_deltas.append((0, 0))
+
+        masks.append((npts, (npts + 7) // 8))
+        deltas_per_pose.append(pose_deltas)
+
+    if large_move_detected:
+        # Reintentar como KF absoluto (con la misma versión/escala)
+        return pack_pose_frame_delta(prev, curr, image_w, image_h, True, seq=seq, ver=ver)
+
+    # Escribir máscaras y deltas (clamp por seguridad)
+    for p, cpose in enumerate(qcurr):
         npts = len(cpose)
         out += struct.pack("<H", min(npts, 0xFFFF))
         pmask = 0
-        for i, (x, y) in enumerate(cpose):
-            px, py = prev[p][i]
-            if x != px or y != py:
+        for i, (xq, yq) in enumerate(cpose):
+            if xq != qprev[p][i][0] or yq != qprev[p][i][1]:
                 pmask |= (1 << i)
         mask_bytes = (npts + 7) // 8
         out += int(pmask).to_bytes(mask_bytes, "little", signed=False)
-        for i, (x, y) in enumerate(cpose):
+
+        for i in range(npts):
             if (pmask >> i) & 1:
-                dx = max(-127, min(127, x - prev[p][i][0]))
-                dy = max(-127, min(127, y - prev[p][i][1]))
+                dx, dy = deltas_per_pose[p][i]
+                dx = max(-127, min(127, dx))
+                dy = max(-127, min(127, dy))
                 out += struct.pack("<bb", dx, dy)
+
     return bytes(out)
 
 
@@ -775,8 +854,12 @@ class GSTWebRTCSession:
                 except Exception as e:
                     self._warn(f"send-string hello failed: {e}")
                 try:
-                    pkt = b"PO" + bytes([0, 0]) + struct.pack("<HH", 1, 1)
-                    gbytes = GLib.Bytes(pkt)
+                    ver = _ver_byte_with_scale(2)
+                    pkt = bytearray(b"PO")
+                    pkt += bytes([ver])
+                    pkt += struct.pack("<H", 0)  # nposes=0
+                    pkt += struct.pack("<HH", _q16_px(1), _q16_px(1))
+                    gbytes = GLib.Bytes(bytes(pkt))
                     ch.emit("send-data", gbytes)
                     self._dbg(f"Sent dummy PO packet on '{ch.props.label}' (1x1, 0 poses)")
                 except Exception as e:

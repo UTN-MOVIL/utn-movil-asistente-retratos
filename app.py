@@ -93,7 +93,7 @@ async def _setup(app, loop):
             delegate_preference="gpu",
             running_mode=mp_vision.RunningMode.VIDEO,  # WebRTC streaming
             max_poses=1,
-            min_pose_detection_confidence=0.5,     
+            min_pose_detection_confidence=0.5,
             min_tracking_confidence=0.2,
         )
         pose_landmarker_video = PoseLandmarkerFactory(pose_cfg_video).create_with_fallback()
@@ -235,40 +235,47 @@ async def _process_face(img_bgr: np.ndarray, return_image: bool):
         raise RuntimeError("No se pudo codificar JPEG.")
     return buf.tobytes(), result
 
-def _poses_px_from_result(result, img_shape) -> Tuple[int, int, List[List[Tuple[int, int]]]]:
-    """Convierte landmarks normalizados → píxeles absolutos."""
+# ───────── Pose/Face → (x,y,z) para WebRTC ─────────
+def _poses_xyz_from_result(result, img_shape) -> Tuple[int, int, List[List[Tuple[float, float, float]]]]:
+    """
+    Devuelve (w, h, poses_xyz) con x,y en píxeles y z normalizado (MediaPipe).
+    """
     h, w = img_shape[:2]
-    poses_px: List[List[Tuple[int, int]]] = []
+    poses_xyz: List[List[Tuple[float, float, float]]] = []
     if not result or not getattr(result, "pose_landmarks", None):
-        return w, h, poses_px
+        return w, h, poses_xyz
     for lms in result.pose_landmarks:
-        pts: List[Tuple[int, int]] = []
+        pts: List[Tuple[float, float, float]] = []
         for lm in lms:
-            x = int(round(lm.x * w))
-            y = int(round(lm.y * h))
-            x = 0 if x < 0 else (w - 1 if x >= w else x)
-            y = 0 if y < 0 else (h - 1 if y >= h else y)
-            pts.append((x, y))
-        poses_px.append(pts)
-    return w, h, poses_px
+            x_px = float(lm.x * w)
+            y_px = float(lm.y * h)
+            z_n  = float(lm.z)  # profundidad normalizada (más negativo = más cerca)
+            # Clip x,y a imagen por seguridad (opcional)
+            x_px = 0.0 if x_px < 0 else (float(w - 1) if x_px >= w else x_px)
+            y_px = 0.0 if y_px < 0 else (float(h - 1) if y_px >= h else y_px)
+            pts.append((x_px, y_px, z_n))
+        poses_xyz.append(pts)
+    return w, h, poses_xyz
 
-# ───────── Face → píxeles y wrappers (para WebRTC) ─────────
-def _faces_px_from_result(result, img_shape) -> Tuple[int, int, List[List[Tuple[int, int]]]]:
-    """Convierte landmarks faciales normalizados → píxeles absolutos."""
+def _faces_xyz_from_result(result, img_shape) -> Tuple[int, int, List[List[Tuple[float, float, float]]]]:
+    """
+    Devuelve (w, h, faces_xyz) con x,y en píxeles y z normalizado (MediaPipe).
+    """
     h, w = img_shape[:2]
-    faces_px: List[List[Tuple[int, int]]] = []
+    faces_xyz: List[List[Tuple[float, float, float]]] = []
     if not result or not getattr(result, "face_landmarks", None):
-        return w, h, faces_px
+        return w, h, faces_xyz
     for lms in result.face_landmarks:
-        pts: List[Tuple[int, int]] = []
+        pts: List[Tuple[float, float, float]] = []
         for lm in lms:
-            x = int(round(lm.x * w))
-            y = int(round(lm.y * h))
-            x = 0 if x < 0 else (w - 1 if x >= w else x)
-            y = 0 if y < 0 else (h - 1 if y >= h else y)
-            pts.append((x, y))
-        faces_px.append(pts)
-    return w, h, faces_px
+            x_px = float(lm.x * w)
+            y_px = float(lm.y * h)
+            z_n  = float(lm.z)
+            x_px = 0.0 if x_px < 0 else (float(w - 1) if x_px >= w else x_px)
+            y_px = 0.0 if y_px < 0 else (float(h - 1) if y_px >= h else y_px)
+            pts.append((x_px, y_px, z_n))
+        faces_xyz.append(pts)
+    return w, h, faces_xyz
 
 def _make_mp_image(rgb_np: np.ndarray):
     return mp.Image(image_format=mp.ImageFormat.SRGBA, data=rgb_np)
@@ -311,14 +318,14 @@ webrtc_bp = build_webrtc_blueprint(
             make_mp_image=_make_mp_image,
             detect_image=_detect_pose_image,
             detect_video=_detect_pose_video,
-            points_from_result=_poses_px_from_result,
+            points_from_result=_poses_xyz_from_result,   # ← ahora XYZ
         ),
         "face": TaskAdapter(
             name="face",
             make_mp_image=_make_mp_image,
             detect_image=_detect_face_image,
             detect_video=_detect_face_video,
-            points_from_result=_faces_px_from_result,
+            points_from_result=_faces_xyz_from_result,   # ← ahora XYZ
         ),
     },
     url_prefix="",

@@ -203,8 +203,6 @@ class PerfMeter:
             avg_e2e = self.sum_e2e_ms_win / self.frames_since
             self.last_snapshot = PerfSnapshot(fps, avg_inf, avg_e2e)
 
-            #print(f"FPS: {fps:.1f} | infer(avg): {avg_inf:.1f} ms | e2e(avg): {avg_e2e:.1f} ms")
-
             # reset ventana 1s
             self.frames_since = 0
             self.sum_infer_ms_win = 0.0
@@ -251,39 +249,75 @@ class PerfMeter:
         }
 
 
+# ─────────────────────── Cálculo de yaw (función separada) ───────────────────────
+
+def shoulder_yaw_deg_from_landmarks(lms, frame_shape=None, min_visibility=0.0) -> float:
+    """
+    Devuelve el yaw (en grados) del torso estimado con los hombros usando pose_landmarks normalizados.
+    Signo: + => hombro derecho MÁS LEJOS; - => hombro derecho MÁS CERCA (adelantado).
+
+    Params
+    - lms: lista de landmarks normalizados (result.pose_landmarks[i])
+    - frame_shape: opcional (h, w) del frame para corregir aspecto en Y.
+    - min_visibility: descarta si la visibilidad de hombros < umbral (si el modelo la provee).
+
+    Return
+    - yaw_deg (float). NaN si no se puede calcular.
+    """
+    if not lms or len(lms) <= 12:
+        return float("nan")
+
+    LS, RS = lms[11], lms[12]
+
+    # Chequeo de visibilidad si existe el atributo (MediaPipe Tasks puede tenerlo)
+    vL = getattr(LS, "visibility", 1.0)
+    vR = getattr(RS, "visibility", 1.0)
+    if (vL is not None and vL < min_visibility) or (vR is not None and vR < min_visibility):
+        return float("nan")
+
+    dz = RS.z - LS.z  # +: derecho más lejos; -: derecho más cerca
+
+    if frame_shape is not None:
+        h, w = frame_shape[:2]
+        if h and w:
+            ax = RS.x - LS.x
+            ay = (RS.y - LS.y) * (w / h)  # escalar Y a “unidades X”
+            w_xy = math.hypot(ax, ay)
+            denom = max(1e-6, w_xy)
+        else:
+            denom = max(1e-6, abs(RS.x - LS.x))
+    else:
+        denom = max(1e-6, abs(RS.x - LS.x))
+
+    yaw_rad = math.atan2(dz, denom)
+    return math.degrees(yaw_rad)
+
+
 # ─────────────────────── Dibujo y overlay ───────────────────────
 
 def calcular_y_mostrar_angulo_hombros(frame_bgr, pose_landmarks, frame_width, frame_height):
     """Calcula y dibuja el ángulo de inclinación de los hombros en el frame."""
-    # MediaPipe Pose Landmarker landmark indices
     LEFT_SHOULDER = 11
     RIGHT_SHOULDER = 12
 
-    # Asegúrate de que los landmarks necesarios están presentes
     if len(pose_landmarks) > RIGHT_SHOULDER:
-        # Obtiene los objetos landmark para los hombros
         lm_izquierdo = pose_landmarks[LEFT_SHOULDER]
         lm_derecho = pose_landmarks[RIGHT_SHOULDER]
 
-        # Extrae las coordenadas (x, y) en píxeles
         hombro_izquierdo = (int(lm_izquierdo.x * frame_width), int(lm_izquierdo.y * frame_height))
-        hombro_derecho = (int(lm_derecho.x * frame_width), int(lm_derecho.y * frame_height))
+        hombro_derecho  = (int(lm_derecho.x  * frame_width), int(lm_derecho.y  * frame_height))
 
-        # Calcula la diferencia en las coordenadas
         dy = hombro_derecho[1] - hombro_izquierdo[1]
         dx = hombro_derecho[0] - hombro_izquierdo[0]
 
-        # Calcula el ángulo en grados
         angle = math.degrees(math.atan2(dy, dx))
 
-        # Dibuja el ángulo en la pantalla
-        # Puedes ajustar la posición (x, y) del texto según necesites
-        texto_angulo = f"Inclinacion: {angle:.1f} grados"
-        cv2.putText(frame_bgr, texto_angulo, (hombro_izquierdo[0], hombro_izquierdo[1] - 20),
+        texto_angulo = f"Inclinación: {angle:.1f}°"
+        cv2.putText(frame_bgr, texto_angulo, (hombro_izquierdo[0], max(20, hombro_izquierdo[1] - 20)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2, cv2.LINE_AA)
 
 def draw_pose_skeleton_bgr(frame_bgr, result) -> None:
-    """Dibuja el esqueleto (POSE_CONNECTIONS) de todas las poses detectadas."""
+    """Dibuja el esqueleto (POSE_CONNECTIONS) y muestra yaw/Δz(norm) de hombros."""
     if not result or not getattr(result, "pose_landmarks", None):
         return
 
@@ -291,13 +325,20 @@ def draw_pose_skeleton_bgr(frame_bgr, result) -> None:
     connections = mp.solutions.pose.POSE_CONNECTIONS  # pares de índices
 
     for lms in result.pose_landmarks:  # lista de poses
-        # ▼▼▼ AÑADE ESTA LÍNEA ▼▼▼
+        # Ángulo 2D de los hombros (ya existente)
         calcular_y_mostrar_angulo_hombros(frame_bgr, lms, w, h)
-        # ▲▲▲ FIN DE LA LÍNEA AÑADIDA ▲▲▲
 
-        pts = [(int(lm.x * w), int(lm.y * h)) for lm in lms]
+        # ── Yaw a partir de landmarks normalizados ──
+        yaw_deg = shoulder_yaw_deg_from_landmarks(lms, frame_shape=(h, w))
+        if not math.isnan(yaw_deg):
+            # Interpretación de signo: yaw<0 ⇒ hombro derecho más cerca (adelante)
+            quien = "Der" if yaw_deg < 0 else "Izq"
+            label = f"yaw≈ {yaw_deg:+.1f}° | adelante: {quien}"
+            cv2.putText(frame_bgr, label, (10, h - 16),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2, cv2.LINE_AA)
 
         # Dibujar conexiones (líneas)
+        pts = [(int(lm.x * w), int(lm.y * h)) for lm in lms]
         for a, b in connections:
             pa, pb = pts[a], pts[b]
             cv2.line(frame_bgr, pa, pb, (0, 255, 0), 2, cv2.LINE_AA)

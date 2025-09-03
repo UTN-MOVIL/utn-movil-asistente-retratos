@@ -97,7 +97,9 @@ if not PRINT_LOGS:
 #   make_mp_image(rgb_np) -> mp.Image
 #   detect_image(mp_image) -> result
 #   detect_video(mp_image, ts_ms: int) -> result
-#   points_from_result(result, img_shape) -> (w, h, List[List[(x,y)]])
+#   points_from_result(result, img_shape)
+#       -> (w:int, h:int, List[List[(x,y)]]]  # v2 (compat)
+#       -> (w:int, h:int, List[List[(x,y,z)]]])  # v3 (nuevo con z)
 # If you don't pass adapters, we fallback to the legacy single-task hooks.
 # ──────────────────────────────────────────────────────────────────────────────
 @dataclass(frozen=True)
@@ -106,7 +108,8 @@ class TaskAdapter:
     make_mp_image: Callable[[np.ndarray], Any]
     detect_image: Callable[[Any], Awaitable[Any] | Any]
     detect_video: Callable[[Any, int], Awaitable[Any] | Any]
-    points_from_result: Callable[[Any, tuple[int, int, int]], tuple[int, int, List[List[Tuple[int, int]]]]]
+    # Nota: devoluciones XY o XYZ; los empaquetadores detectan si hay z.
+    points_from_result: Callable[[Any, tuple[int, int, int]], tuple[int, int, List[List[Tuple[float, ...]]]]]
     log_label: str = "keypoints"
 
 
@@ -161,11 +164,18 @@ POSE_Q_SHIFT = int(os.getenv("POSE_Q_SHIFT", "1"))
 POSE_Q_SHIFT = max(0, min(POSE_Q_SHIFT, 3))
 POSE_Q_SCALE = 1 << POSE_Q_SHIFT
 
+# ───────── Cuantización de Z (normalizado) ─────────
+# Escala independiente para z (normalizado). 2^7=128 suele ir bien para MediaPipe.
+POSE_Z_SHIFT = int(os.getenv("POSE_Z_SHIFT", "7"))
+POSE_Z_SHIFT = max(0, min(POSE_Z_SHIFT, 10))
+POSE_Z_SCALE = 1 << POSE_Z_SHIFT
+
 
 def _ver_byte_with_scale(base_ver: int = 2) -> int:
     """
-    Byte de versión con la escala en los 2 bits bajos.
+    Byte de versión con la escala XY en los 2 bits bajos (shift).
     bits[1:0] = shift (0→1x,1→2x,2→4x)
+    bits[7:2] = base_ver (2=XY, 3=XYZ)
     """
     return (base_ver & 0xFC) | (POSE_Q_SHIFT & 0x03)
 
@@ -175,36 +185,75 @@ def _q16_px(v: float | int) -> int:
     return max(0, min(65535, int(round(float(v) * POSE_Q_SCALE))))  # clamp
 
 
-def _quantize_poses(poses: List[List[Tuple[int | float, int | float]]]) -> List[List[Tuple[int, int]]]:
-    return [[(_q16_px(x), _q16_px(y)) for (x, y) in pts] for pts in poses]
+def _qi16_z(v: float | int) -> int:
+    """Convierte z (normalizado/metros) a int16 en unidades (z * 2^POSE_Z_SHIFT)."""
+    return max(-32768, min(32767, int(round(float(v) * POSE_Z_SCALE))))
+
+
+def _has_z(poses: List[List[Tuple[float, ...]]]) -> bool:
+    """True si al menos un punto trae componente z (len>=3)."""
+    for pts in poses:
+        for p in pts:
+            if len(p) >= 3:
+                return True
+    return False
+
+
+def _quantize_xy(poses_xy: List[List[Tuple[float, float]]]) -> List[List[Tuple[int, int]]]:
+    return [[(_q16_px(x), _q16_px(y)) for (x, y) in pts] for pts in poses_xy]
+
+
+def _quantize_xyz(poses_xyz: List[List[Tuple[float, float, float]]]) -> List[List[Tuple[int, int, int]]]:
+    qposes: List[List[Tuple[int, int, int]]] = []
+    for pts in poses_xyz:
+        qpts: List[Tuple[int, int, int]] = []
+        for p in pts:
+            x, y = p[0], p[1]
+            z = p[2] if len(p) >= 3 else 0.0
+            qpts.append((_q16_px(x), _q16_px(y), _qi16_z(z)))
+        qposes.append(qpts)
+    return qposes
 
 
 # ─────────────── Empaquetadores binarios (PO/PD) ───────────────
-def pack_pose_frame(image_w: int, image_h: int, poses: List[List[Tuple[int, int]]]) -> bytes:
+def pack_pose_frame(image_w: int, image_h: int, poses: List[List[Tuple[float, ...]]]) -> bytes:
     """
-    PO absoluto con W/H y coordenadas cuantizados por 2^POSE_Q_SHIFT.
-    ver: bits[1:0] = shift (0→1x,1→2x,2→4x)
+    PO absoluto con W/H y coordenadas cuantizados.
+    v2 (XY): por punto <HH>
+    v3 (XYZ): por punto <HHh>
+    El byte de versión codifica base_ver (bits 7..2) y shift XY (bits 1..0).
     """
-    ver = _ver_byte_with_scale(2)
+    send_xyz = _has_z(poses)
+    base_ver = 3 if send_xyz else 2
+    ver = _ver_byte_with_scale(base_ver)
     wq = _q16_px(image_w)
     hq = _q16_px(image_h)
-    qposes = _quantize_poses(poses)
 
     out = bytearray()
     out += b"PO"
-    out += bytes([ver])  # version con escala
-    out += struct.pack("<H", min(len(qposes), 0xFFFF))
+    out += bytes([ver])
+    out += struct.pack("<H", min(len(poses), 0xFFFF))
     out += struct.pack("<HH", wq, hq)
-    for pts in qposes:
-        out += struct.pack("<H", min(len(pts), 0xFFFF))
-        for (xq, yq) in pts:
-            out += struct.pack("<HH", xq, yq)
+
+    if send_xyz:
+        qposes = _quantize_xyz(poses)  # [(xq,yq,zq)]
+        for pts in qposes:
+            out += struct.pack("<H", min(len(pts), 0xFFFF))
+            for (xq, yq, zq) in pts:
+                out += struct.pack("<HHh", xq, yq, zq)
+    else:
+        qposes = _quantize_xy(poses)  # [(xq,yq)]
+        for pts in qposes:
+            out += struct.pack("<H", min(len(pts), 0xFFFF))
+            for (xq, yq) in pts:
+                out += struct.pack("<HH", xq, yq)
+
     return bytes(out)
 
 
 def pack_pose_frame_delta(
-    prev: List[List[Tuple[int, int]]] | None,
-    curr: List[List[Tuple[int, int]]],
+    prev: List[List[Tuple[float, ...]]] | None,
+    curr: List[List[Tuple[float, ...]]],
     image_w: int,
     image_h: int,
     keyframe: bool,
@@ -213,18 +262,28 @@ def pack_pose_frame_delta(
     ver: int = 2,
 ) -> bytes:
     """
-    PD con cuantización fija (px * 2^POSE_Q_SHIFT).
+    PD con cuantización fija:
+      - v2 (XY): mask + (dx:int8, dy:int8)
+      - v3 (XYZ): mask + (dx:int8, dy:int8, dz:int8)
     Envía KF si:
       - no hay prev compatible, o contar/longitud difiere, o
-      - algún delta en unidades cuantizadas excede int8 (±127).
+      - algún delta cuantizado excede int8 (±127).
     Optimización "no change": si no cambió nada y ABSOLUTE_INTERVAL_MS<=0 → b"".
     """
-    ver_byte = _ver_byte_with_scale(ver)
+    # Detecta si debemos enviar XYZ (aunque 'ver'==2 se permite, usamos base>=3 si hay z)
+    send_xyz = _has_z(curr) or _has_z(prev or [])
+    base_ver = 3 if send_xyz else max(2, ver)
+    ver_byte = _ver_byte_with_scale(base_ver)
+
     wq = _q16_px(image_w)
     hq = _q16_px(image_h)
 
-    qcurr = _quantize_poses(curr)
-    qprev = _quantize_poses(prev) if prev is not None else None
+    if send_xyz:
+        qcurr = _quantize_xyz(curr)  # [(xq,yq,zq)]
+        qprev = _quantize_xyz(prev) if prev is not None else None
+    else:
+        qcurr = _quantize_xy(curr)   # [(xq,yq)]
+        qprev = _quantize_xy(prev) if prev is not None else None
 
     # ¿Necesita absoluto?
     absolute_needed = (
@@ -236,15 +295,19 @@ def pack_pose_frame_delta(
 
     # "No change" (comparando cuantizados) → permite saltarse envío
     if not keyframe and qprev is not None and len(qprev) == len(qcurr):
-        any_change = any(qcurr[p] != qprev[p] for p in range(len(qcurr)))
+        any_change = False
+        for p in range(len(qcurr)):
+            if qcurr[p] != qprev[p]:
+                any_change = True
+                break
         if (not any_change) and ABSOLUTE_INTERVAL_MS <= 0:
             return b""
 
     # Cabecera PD
     out = bytearray(b"PD")
-    out += bytes([ver_byte])
-    out += bytes([1 if keyframe else 0])
-    if ver >= 1:
+    out += bytes([ver_byte])                      # versión (base_ver+shift)
+    out += bytes([1 if keyframe else 0])          # flag KF
+    if base_ver >= 1:
         out += struct.pack("<H", (seq or 0) & 0xFFFF)
     out += struct.pack("<H", min(len(qcurr), 0xFFFF))
     out += struct.pack("<HH", wq, hq)
@@ -253,59 +316,81 @@ def pack_pose_frame_delta(
     if keyframe:
         for pts in qcurr:
             out += struct.pack("<H", min(len(pts), 0xFFFF))
-            for (xq, yq) in pts:
-                out += struct.pack("<HH", xq, yq)
+            if send_xyz:
+                for (xq, yq, zq) in pts:
+                    out += struct.pack("<HHh", xq, yq, zq)
+            else:
+                for (xq, yq) in pts:
+                    out += struct.pack("<HH", xq, yq)
         return bytes(out)
 
-    # Delta: máscara + int8 (en unidades cuantizadas)
-    # Si algún delta excede ±127 → rehacer como KF
+    # Delta: máscara + deltas int8 (en unidades cuantizadas)
     large_move_detected = False
-
-    # Primero calculamos máscaras y deltas para detectar overflow
-    masks: List[Tuple[int, int]] = []  # (npts, mask_bytes_len) solo para tamaño
-    deltas_per_pose: List[List[Tuple[int, int]]] = []
+    deltas_per_pose: List[List[Tuple[int, ...]]] = []
 
     for p, cpose in enumerate(qcurr):
-        npts = len(cpose)
-        pmask = 0
-        pose_deltas: List[Tuple[int, int]] = []
-
-        for i, (xq, yq) in enumerate(cpose):
-            pxq, pyq = qprev[p][i]
-            if xq != pxq or yq != pyq:
-                dx = xq - pxq
-                dy = yq - pyq
-                if dx < -127 or dx > 127 or dy < -127 or dy > 127:
-                    large_move_detected = True
-                pmask |= (1 << i)
-                pose_deltas.append((dx, dy))
+        pose_deltas: List[Tuple[int, ...]] = []
+        pprev = qprev[p]
+        for i, cur in enumerate(cpose):
+            changed = False
+            if send_xyz:
+                cx, cy, cz = cur
+                px, py, pz = pprev[i]
+                dx, dy, dz = cx - px, cy - py, cz - pz
+                if dx != 0 or dy != 0 or dz != 0:
+                    changed = True
+                    if any(v < -127 or v > 127 for v in (dx, dy, dz)):
+                        large_move_detected = True
+                pose_deltas.append((dx, dy, dz))
             else:
-                pose_deltas.append((0, 0))
-
-        masks.append((npts, (npts + 7) // 8))
+                cx, cy = cur
+                px, py = pprev[i]
+                dx, dy = cx - px, cy - py
+                if dx != 0 or dy != 0:
+                    changed = True
+                    if dx < -127 or dx > 127 or dy < -127 or dy > 127:
+                        large_move_detected = True
+                pose_deltas.append((dx, dy))
         deltas_per_pose.append(pose_deltas)
 
     if large_move_detected:
         # Reintentar como KF absoluto (con la misma versión/escala)
-        return pack_pose_frame_delta(prev, curr, image_w, image_h, True, seq=seq, ver=ver)
+        return pack_pose_frame_delta(prev, curr, image_w, image_h, True, seq=seq, ver=base_ver)
 
     # Escribir máscaras y deltas (clamp por seguridad)
     for p, cpose in enumerate(qcurr):
         npts = len(cpose)
         out += struct.pack("<H", min(npts, 0xFFFF))
+        # Construir máscara de puntos cambiados
         pmask = 0
-        for i, (xq, yq) in enumerate(cpose):
-            if xq != qprev[p][i][0] or yq != qprev[p][i][1]:
-                pmask |= (1 << i)
+        if send_xyz:
+            for i, (cx, cy, cz) in enumerate(cpose):
+                px, py, pz = qprev[p][i]
+                if (cx != px) or (cy != py) or (cz != pz):
+                    pmask |= (1 << i)
+        else:
+            for i, (cx, cy) in enumerate(cpose):
+                px, py = qprev[p][i]
+                if (cx != px) or (cy != py):
+                    pmask |= (1 << i)
+
         mask_bytes = (npts + 7) // 8
         out += int(pmask).to_bytes(mask_bytes, "little", signed=False)
 
+        # Deltas compactos
         for i in range(npts):
             if (pmask >> i) & 1:
-                dx, dy = deltas_per_pose[p][i]
-                dx = max(-127, min(127, dx))
-                dy = max(-127, min(127, dy))
-                out += struct.pack("<bb", dx, dy)
+                if send_xyz:
+                    dx, dy, dz = deltas_per_pose[p][i]
+                    dx = max(-127, min(127, dx))
+                    dy = max(-127, min(127, dy))
+                    dz = max(-127, min(127, dz))
+                    out += struct.pack("<bbb", dx, dy, dz)
+                else:
+                    dx, dy = deltas_per_pose[p][i]
+                    dx = max(-127, min(127, dx))
+                    dy = max(-127, min(127, dy))
+                    out += struct.pack("<bb", dx, dy)
 
     return bytes(out)
 
@@ -386,7 +471,7 @@ def build_webrtc_blueprint(
     make_mp_image: Callable | None = None,
     detect_image: Callable | None = None,
     detect_video: Callable | None = None,
-    poses_px_from_result: Callable | None = None,
+    poses_px_from_result: Callable | None = None,  # legado (XY)
     # New: multiple adapters
     adapters: Dict[str, TaskAdapter] | None = None,
     default_task: str = "pose",
@@ -467,7 +552,7 @@ def build_webrtc_blueprint(
                 make_mp_image=make_mp_image,
                 detect_image=detect_image,
                 detect_video=detect_video,
-                points_from_result=poses_px_from_result,
+                points_from_result=poses_px_from_result,  # XY legado
                 log_label="default"
             )]
 

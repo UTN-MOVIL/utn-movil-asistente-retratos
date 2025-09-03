@@ -7,7 +7,7 @@ def _env_bool(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
 
 # Usa "1" como default si así lo quieres (en tu pregunta lo pones en 1).
-PRINT_LOGS = _env_bool("PRINT_LOGS", "1")
+PRINT_LOGS = _env_bool("PRINT_LOGS", "0")
 STUN_URL = os.getenv("STUN_URL", "stun:stun.l.google.com:19302")
 TURN_URL = os.getenv("TURN_URL")
 TURN_USER = os.getenv("TURN_USERNAME")
@@ -26,6 +26,13 @@ DC_CTRL_ID = int(os.getenv("DC_CTRL_ID", "1"))
 SEND_GREETING = os.getenv("SEND_GREETING", "0") == "1"
 DC_FACE_ID = int(os.getenv("DC_FACE_ID", "2"))
 WAIT_FOR_ICE_MS = int(os.getenv("WAIT_FOR_ICE_MS", "0"))  # 0 = don't wait
+
+# Robustez opcional para redes inestables
+ROBUST_NET = os.getenv("ROBUST_NET", "1") == "1"
+DISCONNECTED_GRACE_S = float(os.getenv("DISCONNECTED_GRACE_S", "20"))
+ICE_PREFER_RELAY = os.getenv("ICE_PREFER_RELAY", "0") == "1"
+CTRL_KEEPALIVE_MS = int(os.getenv("CTRL_KEEPALIVE_MS", "3000"))
+ICE_HTTP_PROXY = os.getenv("ICE_HTTP_PROXY", "").strip()  # ej. http://user:pass@host:3128
 
 def _noop(*_args, **_kwargs):
     return None
@@ -74,7 +81,11 @@ __all__ = [
     "SEND_GREETING",
     "DC_FACE_ID",
     "WAIT_FOR_ICE_MS",
-    # Helpers
+    "ROBUST_NET",
+    "DISCONNECTED_GRACE_S",
+    "ICE_PREFER_RELAY",
+    "CTRL_KEEPALIVE_MS",
+    "ICE_HTTP_PROXY",
     "_env_bool",
     "_log_print",
     "_ts",

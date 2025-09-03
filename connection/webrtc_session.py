@@ -22,26 +22,6 @@ from .decoding import attach_rtp_video_decode_chain
 from .processing import process_frames
 from .config import *
 
-# ─────────────── Logging (mismo switch que en webrtc.py, sin imports circulares) ───────────────
-PRINT_LOGS = os.getenv("PRINT_LOGS", "0") == "1"
-
-def _log_print(*args, **kwargs):
-    if PRINT_LOGS:
-        print(*args, **kwargs)
-
-def _ts():
-    return time.strftime("%H:%M:%S")
-
-# ─────────────── Constantes que usa la clase ───────────────
-NEGOTIATED_DCS = os.getenv("NEGOTIATED_DCS", "1") == "1"
-DC_RESULTS_ID = int(os.getenv("DC_RESULTS_ID", "0"))
-DC_CTRL_ID    = int(os.getenv("DC_CTRL_ID", "1"))
-DC_FACE_ID    = int(os.getenv("DC_FACE_ID", "2"))
-SEND_GREETING = os.getenv("SEND_GREETING", "0") == "1"
-WAIT_FOR_ICE_MS = int(os.getenv("WAIT_FOR_ICE_MS", "0"))
-
-FRAME_GAP_WARN_MS = int(os.getenv("FRAME_GAP_WARN_MS", "180"))
-
 # Cuantización (para el dummy PO cuando abre el DC)
 POSE_Q_SHIFT = max(0, min(3, int(os.getenv("POSE_Q_SHIFT", "1"))))
 POSE_Q_SCALE = 1 << POSE_Q_SHIFT
@@ -72,6 +52,18 @@ def _fmt_turn(turn_url: Optional[str], user: Optional[str], pwd: Optional[str]) 
     auth = f"{user}:{pwd}@" if (user and pwd) else ""
     return f"{scheme}://{auth}{hostpart}?transport=udp"
 
+def _turn_uris(turn_url: Optional[str], user: Optional[str], pwd: Optional[str]) -> List[str]:
+    """Devuelve variantes UDP/TCP/TLS para TURN; si no hay TURN, lista vacía."""
+    if not turn_url:
+        return []
+    host = turn_url.replace("turns://", "").replace("turn://", "")
+    creds = f"{user}:{pwd}@" if (user and pwd) else ""
+    return [
+        f"turn://{creds}{host}?transport=udp",
+        f"turn://{creds}{host}?transport=tcp",
+        f"turns://{creds}{host}",  # TLS (transport implícito)
+    ]
+
 def _has_factory(name: str) -> bool:
     return Gst.ElementFactory.find(name) is not None
 
@@ -80,10 +72,7 @@ sessions: Set["GSTWebRTCSession"] = set()
 
 
 # ─────────────────────────────────────────────────────────────
-#  Pega aquí la definición COMPLETA de tu clase GSTWebRTCSession
-#  (sin el #class original de webrtc.py), con un único cambio:
-#  donde decía `_sessions.discard(self)` reemplázalo por
-#  `sessions.discard(self)`.
+#  Clase GSTWebRTCSession (modificada para mayor robustez)
 # ─────────────────────────────────────────────────────────────
 
 class GSTWebRTCSession:
@@ -144,7 +133,7 @@ class GSTWebRTCSession:
             delta_sent=0,
             bytes_sent=0,
             drops_due_buffer=0,
-            dc_recycles=0,  # maintained for backward compat; no actual recycle on negotiated
+            dc_recycles=0,  # backward compat
             infer_ms_last=0.0,
             infer_ms_avg=0.0,
             acks=0,
@@ -158,8 +147,18 @@ class GSTWebRTCSession:
         self._appsink_caps_sig: Optional[str] = None
         self._proc_n = 0
 
-        # ── New: ring buffer for bus diagnostics
+        # ── Bus diagnostics
         self._bus_tail: deque[str] = deque(maxlen=50)
+
+        # ── Robustness helpers
+        self._disco_timer: Optional[asyncio.TimerHandle] = None
+        self._grace_s: float = DISCONNECTED_GRACE_S
+        self._ka_task: Optional[asyncio.Task] = None
+        self._ka_ms: int = CTRL_KEEPALIVE_MS
+
+        # refs to jitter/queue for potential diagnostics
+        self._jbuf: Optional[Gst.Element] = None
+        self._leakyq: Optional[Gst.Element] = None
 
         self._info(f"New session created; tasks={[a.name for a in adapters]}")
 
@@ -191,7 +190,6 @@ class GSTWebRTCSession:
     def _start_processing_task(self):
         if not self.process_task or self.process_task.done():
             self._info("Starting frame processing task")
-            # now call the externalized loop
             self.process_task = self.loop.create_task(process_frames(self))
 
     def _enqueue_frame(self, frame_np, pts_ns, w, h):
@@ -258,12 +256,35 @@ class GSTWebRTCSession:
         assert self.webrtc is not None, "webrtcbin plugin not available"
         self.webrtc.set_property("latency", 0)
 
-        # STUN/TURN
+        # STUN
         self.webrtc.set_property("stun-server", _fmt_stun(STUN_URL))
-        turl = _fmt_turn(TURN_URL, TURN_USER, TURN_PASS)
-        if turl:
-            self.webrtc.set_property("turn-server", turl)
-        self._info(f"Using STUN={_fmt_stun(STUN_URL)} TURN={'set' if turl else 'False'}")
+
+        # TURN (múltiples rutas UDP/TCP/TLS)
+        added = 0
+        for uri in _turn_uris(TURN_URL, TURN_USER, TURN_PASS):
+            try:
+                ok = self.webrtc.emit("add-turn-server", uri)
+                self._info(f"Added TURN: {uri} ok={ok}")
+                added += 1
+            except Exception as e:
+                self._warn(f"add-turn-server failed for {uri}: {e}")
+        if ICE_HTTP_PROXY:
+            try:
+                self.webrtc.set_property("http-proxy", ICE_HTTP_PROXY)
+                self._info(f"HTTP proxy set for TURN/TCP: {ICE_HTTP_PROXY}")
+            except Exception as e:
+                self._warn(f"Could not set http-proxy: {e}")
+
+        # Política de transporte: ALL (luego podemos ir a RELAY si hace falta)
+        try:
+            self.webrtc.set_property(
+                "ice-transport-policy",
+                GstWebRTC.WebRTCICETransportPolicy.ALL
+            )
+        except Exception:
+            pass
+
+        self._info(f"Using STUN={_fmt_stun(STUN_URL)} TURN={'yes' if added else 'no'}")
 
         # Bundle policy
         self.webrtc.set_property("bundle-policy", GstWebRTC.WebRTCBundlePolicy.MAX_BUNDLE)
@@ -284,8 +305,7 @@ class GSTWebRTCSession:
             bus.connect("message", self._on_bus_message)
         self._info("Pipeline constructed")
 
-        # IMPORTANT: Do NOT pre-create negotiated DCs here anymore.
-        # We'll create them *after* set-remote-description and *before* create-answer.
+        # IMPORTANT: negotiated DCs *after* SRD
         if NEGOTIATED_DCS:
             self._info("Negotiated DCs will be created after SRD (skip DCEP)")
         else:
@@ -384,8 +404,21 @@ class GSTWebRTCSession:
         self.pipeline.set_state(Gst.State.PLAYING)
         self._info("Pipeline PLAYING")
 
+        # start ctrl keepalive loop (non-fatal if ctrl not ready yet)
+        if not self._ka_task:
+            self._ka_task = self.loop.create_task(self._keepalive_loop())
+
     async def stop(self):
         self._info("Stopping session")
+        try:
+            if self._ka_task:
+                self._ka_task.cancel()
+                with contextlib.suppress(Exception):
+                    await self._ka_task
+        except Exception as e:
+            self._warn(f"Error awaiting keepalive cancel: {e}")
+        self._ka_task = None
+
         try:
             if self.process_task:
                 self.process_task.cancel()
@@ -596,6 +629,19 @@ class GSTWebRTCSession:
         dc.connect("on-message-string", _on_msg_str)
         dc.connect("on-message-data", _on_msg_bin)
 
+    async def _keepalive_loop(self):
+        """Pequeño ping periódico por 'ctrl' para detectar stalls y medir RTT."""
+        while True:
+            await asyncio.sleep(self._ka_ms / 1000.0)
+            if not self.ctrl_dc:
+                continue
+            try:
+                self.seq = (self.seq + 1) & 0xFFFF
+                self.ctrl_dc.emit("send-string", f"PING {self.seq}")
+                self._awaiting_ack[self.seq] = int(time.monotonic() * 1000)
+            except Exception as e:
+                self._warn(f"keepalive send error: {e}")
+
     def _on_data_channel(self, webrtc, channel: GstWebRTC.WebRTCDataChannel):
         # For DCEP-created channels (NEGOTIATED_DCS=0). Negotiated channels we create locally.
         label = channel.props.label or ""
@@ -627,13 +673,48 @@ class GSTWebRTCSession:
             except Exception:
                 pass
 
+    def _disconnect_grace_elapsed(self):
+        # Se ejecuta después del período de gracia si seguimos desconectados
+        if not self.webrtc:
+            return
+        try:
+            st = self.webrtc.get_property("connection-state")
+        except Exception:
+            st = None
+        if st != GstWebRTC.WebRTCPeerConnectionState.CONNECTED:
+            self._warn(f"Still {st.value_nick if st else 'unknown'} after grace; keeping PC alive.")
+            if ICE_PREFER_RELAY:
+                try:
+                    self.webrtc.set_property(
+                        "ice-transport-policy",
+                        GstWebRTC.WebRTCICETransportPolicy.RELAY
+                    )
+                    self._info("Switched ice-transport-policy to RELAY")
+                except Exception as e:
+                    self._warn(f"Could not set ice-transport-policy to RELAY: {e}")
+
     def _on_conn_state(self, webrtc, _pspec):
         state = self.webrtc.get_property("connection-state")
         self._info(f"PC state: {state.value_nick}")
+
+        if state == GstWebRTC.WebRTCPeerConnectionState.CONNECTED:
+            # Cancelar ventana de gracia y pedir keyframe para re-sincronizar
+            if self._disco_timer:
+                self._disco_timer.cancel()
+                self._disco_timer = None
+            self.need_keyframe = True
+            return
+
+        if state == GstWebRTC.WebRTCPeerConnectionState.DISCONNECTED:
+            # Ventana de gracia: no derribar de inmediato
+            if self._disco_timer:
+                self._disco_timer.cancel()
+            self._disco_timer = self.loop.call_later(self._grace_s, self._disconnect_grace_elapsed)
+            return
+
         if state in (
             GstWebRTC.WebRTCPeerConnectionState.FAILED,
             GstWebRTC.WebRTCPeerConnectionState.CLOSED,
-            GstWebRTC.WebRTCPeerConnectionState.DISCONNECTED,
         ):
             try:
                 sessions.discard(self)
@@ -703,21 +784,35 @@ class GSTWebRTCSession:
             if not jbuf or not q:
                 raise RuntimeError("Failed to create rtpjitterbuffer/queue")
 
-            # Configure for low latency
+            # Configure for low latency (por defecto)
             jbuf.set_property("latency", 0)
             jbuf.set_property("drop-on-late", True)
-            jbuf.set_property("do-lost", True)  # NEW ↓
-            # Do not wait for retransmissions; keep minimal reordering window.
+            jbuf.set_property("do-lost", True)
             if jbuf.find_property("do-retransmission"):
                 jbuf.set_property("do-retransmission", False)
             if jbuf.find_property("max-reorder"):  # packets
-                jbuf.set_property("max-reorder", 8)  # small but safe
+                jbuf.set_property("max-reorder", 8)
             if jbuf.find_property("max-dropout-time"):  # ms
-                jbuf.set_property("max-dropout-time", 50)  # don’t wait long on timestamp jumps
+                jbuf.set_property("max-dropout-time", 50)
             if jbuf.find_property("rtx-retry-time"):
-                jbuf.set_property("rtx-retry-time", 0)  # don't wait for RTX
+                jbuf.set_property("rtx-retry-time", 0)
             if jbuf.find_property("drop-duplicates"):
                 jbuf.set_property("drop-duplicates", True)
+
+            # Si queremos más robustez, dar un pequeño margen y permitir retransmisión
+            if ROBUST_NET:
+                try:
+                    # pequeño buffer de playout en PC y jbuf
+                    try:
+                        cur = int(self.webrtc.get_property("latency") or 0)
+                        self.webrtc.set_property("latency", max(60, cur))
+                    except Exception:
+                        pass
+                    jbuf.set_property("latency", max(50, int(jbuf.get_property("latency") or 0)))
+                    if jbuf.find_property("do-retransmission"):
+                        jbuf.set_property("do-retransmission", True)
+                except Exception as e:
+                    self._warn(f"ROBUST_NET jitterbuffer config failed: {e}")
 
             q.set_property("leaky", 2)  # downstream
             q.set_property("max-size-buffers", 1)
@@ -759,6 +854,8 @@ class GSTWebRTCSession:
                 _fallback_direct_attach()
                 return
 
+            self._jbuf = jbuf
+            self._leakyq = q
             self._dbg("Inserted rtpjitterbuffer + leaky queue before decode chain (links OK)")
 
             # Feed the decode chain from the queue's SRC pad
@@ -836,8 +933,8 @@ class GSTWebRTCSession:
             self._warn(f"appsink new-sample error: {e}")
             return Gst.FlowReturn.ERROR
 
-    # (NOTE) _process_frames has been moved to connection/processing.py
-    # and is scheduled via _start_processing_task().
+    # (NOTE) _process_frames ha sido movido a connection/processing.py
+    # y se agenda vía _start_processing_task().
 
     # ───── Diagnostics snapshot ─────
     def snapshot(self) -> Dict[str, object]:

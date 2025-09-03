@@ -238,23 +238,42 @@ async def _process_face(img_bgr: np.ndarray, return_image: bool):
 # ───────── Pose/Face → (x,y,z) para WebRTC ─────────
 def _poses_xyz_from_result(result, img_shape) -> Tuple[int, int, List[List[Tuple[float, float, float]]]]:
     """
-    Devuelve (w, h, poses_xyz) con x,y en píxeles y z normalizado (MediaPipe).
+    Devuelve (w, h, poses_xyz) con:
+      x,y = píxeles (para dibujar en 2D)
+      z   = profundidad preferentemente en METROS (world.z); si no hay, usa normalizado.
     """
     h, w = img_shape[:2]
     poses_xyz: List[List[Tuple[float, float, float]]] = []
     if not result or not getattr(result, "pose_landmarks", None):
         return w, h, poses_xyz
-    for lms in result.pose_landmarks:
+
+    worlds_all = getattr(result, "pose_world_landmarks", None)
+
+    for i, lms in enumerate(result.pose_landmarks):
         pts: List[Tuple[float, float, float]] = []
-        for lm in lms:
+
+        # world de la misma pose si existe
+        world_i = worlds_all[i] if (worlds_all and len(worlds_all) > i and worlds_all[i]) else None
+
+        for j, lm in enumerate(lms):
             x_px = float(lm.x * w)
             y_px = float(lm.y * h)
-            z_n  = float(lm.z)  # profundidad normalizada (más negativo = más cerca)
-            # Clip x,y a imagen por seguridad (opcional)
-            x_px = 0.0 if x_px < 0 else (float(w - 1) if x_px >= w else x_px)
-            y_px = 0.0 if y_px < 0 else (float(h - 1) if y_px >= h else y_px)
-            pts.append((x_px, y_px, z_n))
+
+            # z preferente: world (metros). Fallback: normalizado.
+            if world_i:
+                z_val = float(world_i[j].z)  # metros
+            else:
+                z_val = float(lm.z)          # normalizado
+
+            # Clip por seguridad
+            if x_px < 0: x_px = 0.0
+            elif x_px >= w: x_px = float(w - 1)
+            if y_px < 0: y_px = 0.0
+            elif y_px >= h: y_px = float(h - 1)
+
+            pts.append((x_px, y_px, z_val))
         poses_xyz.append(pts)
+
     return w, h, poses_xyz
 
 def _faces_xyz_from_result(result, img_shape) -> Tuple[int, int, List[List[Tuple[float, float, float]]]]:

@@ -8,347 +8,158 @@ import os
 import asyncio
 import json
 from pathlib import Path
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple  # (not strictly needed now, but left for typing parity)
 
 import numpy as np
 import cv2
 import mediapipe as mp
 from mediapipe.tasks.python import vision as mp_vision
 
-# ─────────────── Tus módulos propios ───────────────
-# Pose (estilo "puntos_faciales" con MediaPipe Tasks)
-from modules.esqueleto import (
-    AppConfig as PoseAppConfig,
-    LandmarkerFactory as PoseLandmarkerFactory,
-    ensure_file as ensure_pose_model,
-    DEFAULT_MODEL_URLS as POSE_MODEL_URLS,
-    draw_pose_skeleton_bgr,
-)
+# ─────────────── Plugin registry (generic) ───────────────
+from inference.core import InferencePlugin, InferenceRuntime
+from inference.pose_plugin import POSE_PLUGIN
+from inference.face_plugin import FACE_PLUGIN
 
-# Face (tu módulo existente “puntos_faciales”)
-from modules.puntos_faciales import (
-    AppConfig as FaceAppConfig,
-    LandmarkerFactory as FaceLandmarkerFactory,
-    ensure_file as ensure_face_model,
-    DEFAULT_MODEL_URLS as FACE_MODEL_URLS,
-    draw_landmarks_bgr as face_draw_landmarks,
-)
+PLUGINS: dict[str, InferencePlugin] = {
+    "pose": POSE_PLUGIN,
+    "face": FACE_PLUGIN,
+}
+RUNTIMES: dict[str, InferenceRuntime] = {}
 
 # ─────────────── WebRTC en módulo aparte ───────────────
-from connection.webrtc import build_webrtc_blueprint, TaskAdapter  # <— UPDATED
+from connection.webrtc import build_webrtc_blueprint, TaskAdapter  # <— uses registry below
 
 app = Sanic("MiAppHttpWebSocket")
 
-# ─────────────── Globals (pose + face + locks) ───────────────
-pose_landmarker_image: Optional[object] = None
-pose_landmarker_video: Optional[object] = None
-pose_lock: asyncio.Lock | None = None
-
-face_landmarker: Optional[object] = None
-face_lock: asyncio.Lock | None = None
-
-# ─────────────── Flags/ENV necesarios aquí ───────────────
-POSE_USE_VIDEO = os.getenv("POSE_USE_VIDEO", "0") == "1"
-
-# ─────────────── Lifecycle ───────────────
+# ─────────────── Lifecycle (generic setup/cleanup) ───────────────
 @app.listener("before_server_start")
 async def _setup(app, loop):
-    """Inicializa modelos de Pose y Face (IMAGE y opcional VIDEO)."""
-    global pose_landmarker_image, pose_landmarker_video, pose_lock
-    global face_landmarker, face_lock
-
-    HERE = Path(__file__).resolve().parent
-    ROOT = HERE.parent if HERE.name == "tests" else HERE
+    ROOT = Path(__file__).resolve().parent
     MODEL_DIR = ROOT / "models"
     MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Locks
-    if pose_lock is None:
-        pose_lock = asyncio.Lock()
-    if face_lock is None:
-        face_lock = asyncio.Lock()
+    for name, plugin in PLUGINS.items():
+        rt = InferenceRuntime(plugin, MODEL_DIR)
+        RUNTIMES[name] = rt
 
-    # ---- Pose (IMAGE) ----
-    POSE_MODEL_PATH = Path(
-        os.getenv("POSE_LANDMARKER_PATH", str(MODEL_DIR / "pose_landmarker.task"))
-    )
-    ensure_pose_model(POSE_MODEL_PATH, POSE_MODEL_URLS, min_bytes=1_000_000)
+        # resolve model path and ensure it exists
+        model_path = Path(os.getenv(plugin.env_model_path_key,
+                                    str(MODEL_DIR / plugin.default_model_filename)))
+        plugin.ensure_model(model_path, plugin.model_urls, min_bytes=1_000_000)
+        rt.model_path = model_path
 
-    pose_cfg_image = PoseAppConfig(
-        model_path=POSE_MODEL_PATH,
-        model_urls=list(POSE_MODEL_URLS),
-        delegate_preference="gpu",                 # "gpu" | "cpu" | "auto"
-        running_mode=mp_vision.RunningMode.IMAGE,  # HTTP/WS imágenes sueltas
-        max_poses=1,
-        min_pose_detection_confidence=0.5,
-    )
-    pose_landmarker_image = PoseLandmarkerFactory(pose_cfg_image).create_with_fallback()
-    logger.info("PoseLandmarker (IMAGE) inicializado.")
+        # create IMAGE landmarker
+        cfg_img = plugin.make_config(model_path, mp_vision.RunningMode.IMAGE)
+        rt.image_lmk = plugin.factory_cls(cfg_img).create_with_fallback()
+        logger.info(f"{name} (IMAGE) inicializado.")
 
-    # ---- Pose (VIDEO) opcional para WebRTC ----
-    if POSE_USE_VIDEO:
-        pose_cfg_video = PoseAppConfig(
-            model_path=POSE_MODEL_PATH,
-            model_urls=list(POSE_MODEL_URLS),
-            delegate_preference="gpu",
-            running_mode=mp_vision.RunningMode.VIDEO,  # WebRTC streaming
-            max_poses=1,
-            min_pose_detection_confidence=0.5,
-            min_tracking_confidence=0.2,
-        )
-        pose_landmarker_video = PoseLandmarkerFactory(pose_cfg_video).create_with_fallback()
-        logger.info("PoseLandmarker (VIDEO) inicializado.")
-    else:
-        pose_landmarker_video = None
-        logger.info("POSE_USE_VIDEO=0 → WebRTC usará PoseLandmarker (IMAGE).")
-
-    # ---- Face (IMAGE) ----
-    FACE_MODEL_PATH = Path(
-        os.getenv("FACE_LANDMARKER_PATH", str(MODEL_DIR / "face_landmarker.task"))
-    )
-    ensure_face_model(FACE_MODEL_PATH, FACE_MODEL_URLS, min_bytes=1_000_000)
-
-    face_cfg = FaceAppConfig(
-        model_path=FACE_MODEL_PATH,
-        model_urls=list(FACE_MODEL_URLS),
-        delegate_preference="gpu",
-        running_mode=mp_vision.RunningMode.IMAGE,
-        max_faces=1,
-        min_face_detection_confidence=0.7,
-    )
-    face_landmarker = FaceLandmarkerFactory(face_cfg).create_with_fallback()
-    logger.info("FaceLandmarker (IMAGE) inicializado.")
+        # optionally create VIDEO landmarker
+        use_video = False
+        if plugin.use_video_env_key:
+            use_video = os.getenv(plugin.use_video_env_key, "0") == "1"
+        if use_video:
+            cfg_vid = plugin.make_config(model_path, mp_vision.RunningMode.VIDEO)
+            rt.video_lmk = plugin.factory_cls(cfg_vid).create_with_fallback()
+            logger.info(f"{name} (VIDEO) inicializado.")
+        else:
+            logger.info(f"{name}: VIDEO desactivado; reutilizará IMAGE si aplica.")
 
 @app.listener("after_server_stop")
 async def _cleanup(app, loop):
-    """Libera los recursos de los landmarkers."""
-    global pose_landmarker_image, pose_landmarker_video, face_landmarker
+    for rt in RUNTIMES.values():
+        rt.close()
+    RUNTIMES.clear()
+    logger.info("Landmarkers liberados.")
 
-    try:
-        if pose_landmarker_image and hasattr(pose_landmarker_image, "close"):
-            pose_landmarker_image.close()
-    except Exception:
-        pass
-    pose_landmarker_image = None
-
-    try:
-        if pose_landmarker_video and hasattr(pose_landmarker_video, "close"):
-            pose_landmarker_video.close()
-    except Exception:
-        pass
-    pose_landmarker_video = None
-
-    try:
-        if face_landmarker and hasattr(face_landmarker, "close"):
-            face_landmarker.close()
-    except Exception:
-        pass
-    face_landmarker = None
-
-    logger.info("Pose/Face Landmarkers liberados.")
-
-# ─────────────── Serializadores / Procesamiento (HTTP/WS) ───────────────
-def _results_pose_to_json(result, img_shape):
-    h, w = img_shape[:2]
-    if not result or not getattr(result, "pose_landmarks", None):
-        return {"poses": [], "image_size": {"w": w, "h": h}, "num_poses": 0}
-
-    poses = []
-    for lms in result.pose_landmarks:
-        poses.append(
-            [
-                {
-                    "x": float(lm.x),
-                    "y": float(lm.y),
-                    "z": float(lm.z),
-                    "visibility": float(getattr(lm, "visibility", 0.0)),
-                    "px": float(lm.x * w),
-                    "py": float(lm.y * h),
-                }
-                for lm in lms
-            ]
-        )
-    return {"poses": poses, "image_size": {"w": w, "h": h}, "num_poses": len(poses)}
-
-async def _process_pose(img_bgr: np.ndarray, return_image: bool):
-    """Corre Pose (IMAGE) y opcionalmente dibuja, devolviendo JPEG bytes."""
-    global pose_landmarker_image, pose_lock
-    if pose_landmarker_image is None or pose_lock is None:
-        raise RuntimeError("PoseLandmarker (IMAGE) no está inicializado.")
-
+# ─────────────── Generic helpers (detect + draw) ───────────────
+def _make_mp_image_from_bgr(img_bgr: np.ndarray):
     rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+    return mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
 
-    async with pose_lock:
-        result = pose_landmarker_image.detect(mp_image)
+async def detect_image(task: str, mp_image: mp.Image):
+    rt = RUNTIMES[task]
+    async with rt.lock:
+        return rt.image_lmk.detect(mp_image)
 
-    if not return_image:
+async def detect_video(task: str, mp_image: mp.Image, ts_ms: int):
+    rt = RUNTIMES[task]
+    async with rt.lock:
+        if rt.video_lmk is not None:
+            return rt.video_lmk.detect_for_video(mp_image, ts_ms)
+        return rt.image_lmk.detect(mp_image)  # graceful fallback
+
+async def process_image(task: str, img_bgr: np.ndarray, return_image: bool):
+    rt = RUNTIMES[task]
+    plugin = rt.plugin
+    mp_img = _make_mp_image_from_bgr(img_bgr)
+    result = await detect_image(task, mp_img)
+    if not return_image or not plugin.draw_on_bgr:
         return None, result
-
     frame = img_bgr.copy()
-    draw_pose_skeleton_bgr(frame, result)
+    plugin.draw_on_bgr(frame, result)
     ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
     if not ok:
         raise RuntimeError("No se pudo codificar JPEG.")
     return buf.tobytes(), result
 
-def _results_face_to_json(result, img_shape):
-    h, w = img_shape[:2]
-    if not result or not getattr(result, "face_landmarks", None):
-        return {"faces": [], "image_size": {"w": w, "h": h}, "num_faces": 0}
+# ─────────────── WS genérico para cualquier tarea registrada ───────────────
+@app.websocket("/ws/<task>")
+async def ws_generic(request, ws, task: str):
+    if task not in PLUGINS:
+        await ws.send(f"Tarea desconocida: {task}. Disponibles: {list(PLUGINS)}")
+        await ws.close(code=1008, reason="unknown task")
+        return
 
-    faces = []
-    for landmarks in result.face_landmarks:
-        faces.append(
-            [
-                {
-                    "x": float(lm.x),
-                    "y": float(lm.y),
-                    "z": float(lm.z),
-                    "px": float(lm.x * w),
-                    "py": float(lm.y * h),
-                }
-                for lm in landmarks
-            ]
-        )
-    return {"faces": faces, "image_size": {"w": w, "h": h}, "num_faces": len(faces)}
+    print(f">>> WS/{task} conectado. Enviar binario (JPEG/PNG); 'bye' para cerrar.")
+    plugin = PLUGINS[task]
 
-async def _process_face(img_bgr: np.ndarray, return_image: bool):
-    """Corre Face (IMAGE) y opcionalmente dibuja, devolviendo JPEG bytes."""
-    global face_landmarker, face_lock
-    if face_landmarker is None or face_lock is None:
-        raise RuntimeError("FaceLandmarker no está inicializado.")
+    while True:
+        try:
+            msg = await ws.recv()
+            if isinstance(msg, str):
+                if msg.lower().strip() in {"bye", "close"}:
+                    await ws.send("closing")
+                    await ws.close(code=1000, reason="bye")
+                    break
+                await ws.send("Envía imagen binaria (JPEG/PNG) o 'bye' para cerrar.")
+                continue
 
-    rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-    mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            arr = np.frombuffer(msg, dtype=np.uint8)
+            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+            if img is None:
+                await ws.send("No se pudo decodificar la imagen. Usa JPEG/PNG.")
+                continue
 
-    async with face_lock:
-        result = face_landmarker.detect(mp_image)
+            _, result = await process_image(task, img, return_image=False)
+            payload = plugin.to_json(result, img.shape)
+            await ws.send(json.dumps(payload))
+        except Exception as e:
+            print(f">>> ERROR en ws/{task}: {e}")
+            break
+    print(f">>> WS/{task} desconectado.")
 
-    if not return_image:
-        return None, result
-
-    frame = img_bgr.copy()
-    face_draw_landmarks(frame, result)
-    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 90])
-    if not ok:
-        raise RuntimeError("No se pudo codificar JPEG.")
-    return buf.tobytes(), result
-
-# ───────── Pose/Face → (x,y,z) para WebRTC ─────────
-def _poses_xyz_from_result(result, img_shape) -> Tuple[int, int, List[List[Tuple[float, float, float]]]]:
-    """
-    Devuelve (w, h, poses_xyz) con:
-      x,y = píxeles (para dibujar en 2D)
-      z   = profundidad preferentemente en METROS (world.z); si no hay, usa normalizado.
-    """
-    h, w = img_shape[:2]
-    poses_xyz: List[List[Tuple[float, float, float]]] = []
-    if not result or not getattr(result, "pose_landmarks", None):
-        return w, h, poses_xyz
-
-    worlds_all = getattr(result, "pose_world_landmarks", None)
-
-    for i, lms in enumerate(result.pose_landmarks):
-        pts: List[Tuple[float, float, float]] = []
-
-        # world de la misma pose si existe
-        world_i = worlds_all[i] if (worlds_all and len(worlds_all) > i and worlds_all[i]) else None
-
-        for j, lm in enumerate(lms):
-            x_px = float(lm.x * w)
-            y_px = float(lm.y * h)
-
-            # z preferente: world (metros). Fallback: normalizado.
-            if world_i:
-                z_val = float(world_i[j].z)  # metros
-            else:
-                z_val = float(lm.z)          # normalizado
-
-            # Clip por seguridad
-            if x_px < 0: x_px = 0.0
-            elif x_px >= w: x_px = float(w - 1)
-            if y_px < 0: y_px = 0.0
-            elif y_px >= h: y_px = float(h - 1)
-
-            pts.append((x_px, y_px, z_val))
-        poses_xyz.append(pts)
-
-    return w, h, poses_xyz
-
-def _faces_xyz_from_result(result, img_shape) -> Tuple[int, int, List[List[Tuple[float, float, float]]]]:
-    """
-    Devuelve (w, h, faces_xyz) con x,y en píxeles y z normalizado (MediaPipe).
-    """
-    h, w = img_shape[:2]
-    faces_xyz: List[List[Tuple[float, float, float]]] = []
-    if not result or not getattr(result, "face_landmarks", None):
-        return w, h, faces_xyz
-    for lms in result.face_landmarks:
-        pts: List[Tuple[float, float, float]] = []
-        for lm in lms:
-            x_px = float(lm.x * w)
-            y_px = float(lm.y * h)
-            z_n  = float(lm.z)
-            x_px = 0.0 if x_px < 0 else (float(w - 1) if x_px >= w else x_px)
-            y_px = 0.0 if y_px < 0 else (float(h - 1) if y_px >= h else y_px)
-            pts.append((x_px, y_px, z_n))
-        faces_xyz.append(pts)
-    return w, h, faces_xyz
-
-def _make_mp_image(rgb_np: np.ndarray):
+# ─────────────── Registrar el Blueprint WebRTC a partir del registry ───────────────
+def _make_mp_image_srgba(rgb_np: np.ndarray):
+    # keep your SRGBA variant used by WebRTC, if needed
     return mp.Image(image_format=mp.ImageFormat.SRGBA, data=rgb_np)
 
-async def _detect_pose_image(mp_image: mp.Image):
-    global pose_landmarker_image, pose_lock
-    if pose_landmarker_image is None or pose_lock is None:
-        raise RuntimeError("PoseLandmarker (IMAGE) no está inicializado.")
-    async with pose_lock:
-        return pose_landmarker_image.detect(mp_image)
+adapters = {}
+for name, plugin in PLUGINS.items():
+    def _mk_detect_image(nm):
+        async def inner(mp_img): return await detect_image(nm, mp_img)
+        return inner
+    def _mk_detect_video(nm):
+        async def inner(mp_img, ts_ms): return await detect_video(nm, mp_img, ts_ms)
+        return inner
+    adapters[name] = TaskAdapter(
+        name=name,
+        make_mp_image=_make_mp_image_srgba,
+        detect_image=_mk_detect_image(name),
+        detect_video=_mk_detect_video(name),
+        points_from_result=plugin.points_from_result,
+    )
 
-async def _detect_pose_video(mp_image: mp.Image, ts_ms: int):
-    global pose_landmarker_video, pose_landmarker_image, pose_lock
-    if pose_lock is None:
-        raise RuntimeError("pose_lock no está inicializado.")
-    async with pose_lock:
-        if pose_landmarker_video is not None:
-            return pose_landmarker_video.detect_for_video(mp_image, ts_ms)
-        if pose_landmarker_image is None:
-            raise RuntimeError("No hay landmarker de pose inicializado.")
-        return pose_landmarker_image.detect(mp_image)
-
-async def _detect_face_image(mp_image: mp.Image):
-    """Face en modo IMAGE (usado también en WebRTC)."""
-    global face_landmarker, face_lock
-    if face_landmarker is None or face_lock is None:
-        raise RuntimeError("FaceLandmarker no está inicializado.")
-    async with face_lock:
-        return face_landmarker.detect(mp_image)
-
-async def _detect_face_video(mp_image: mp.Image, ts_ms: int):
-    """Wrapper VIDEO para Face que delega a IMAGE."""
-    return await _detect_face_image(mp_image)
-
-# ───────── Registrar el Blueprint WebRTC (dos tareas: pose + face) ─────────
-webrtc_bp = build_webrtc_blueprint(
-    adapters={
-        "pose": TaskAdapter(
-            name="pose",
-            make_mp_image=_make_mp_image,
-            detect_image=_detect_pose_image,
-            detect_video=_detect_pose_video,
-            points_from_result=_poses_xyz_from_result,   # ← ahora XYZ
-        ),
-        "face": TaskAdapter(
-            name="face",
-            make_mp_image=_make_mp_image,
-            detect_image=_detect_face_image,
-            detect_video=_detect_face_video,
-            points_from_result=_faces_xyz_from_result,   # ← ahora XYZ
-        ),
-    },
-    url_prefix="",
-)
+webrtc_bp = build_webrtc_blueprint(adapters=adapters, url_prefix="")
 app.blueprint(webrtc_bp)
 
 # ─────────────── Endpoints HTTP/WS (no WebRTC) ───────────────
@@ -365,7 +176,7 @@ async def http_handler(request):
 @app.route("/", methods=["GET"])
 async def root_handler(request):
     return response.text(
-        "Servidor Sanic OK. Prueba /ws, /http, /ws/pose, /ws/face o /webrtc/offer (POST signaling)."
+        "Servidor Sanic OK. Prueba /ws, /http, /ws/<tarea> (p. ej. /ws/pose, /ws/face) o /webrtc/offer (POST signaling)."
     )
 
 @app.websocket("/ws")
@@ -382,64 +193,6 @@ async def websocket_handler(request, ws):
             print(f">>> ERROR en el manejador WebSocket: {e}")
             break
     print(">>> Manejador WebSocket finalizado para esta conexión.")
-
-@app.websocket("/ws/pose")
-async def ws_pose(request, ws):
-    """Envía imagen binaria (JPEG/PNG); responde JSON de pose."""
-    print(">>> WS/pose conectado. Enviar binario (JPEG/PNG); 'bye' para cerrar.")
-    while True:
-        try:
-            msg = await ws.recv()
-            if isinstance(msg, str):
-                if msg.lower().strip() in {"bye", "close"}:
-                    await ws.send("closing")
-                    await ws.close(code=1000, reason="bye")
-                    break
-                await ws.send("Envía imagen binaria (JPEG/PNG) o 'bye' para cerrar.")
-                continue
-
-            arr = np.frombuffer(msg, dtype=np.uint8)
-            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if img is None:
-                await ws.send("No se pudo decodificar la imagen. Usa JPEG/PNG.")
-                continue
-
-            _, result = await _process_pose(img, return_image=False)
-            payload = _results_pose_to_json(result, img.shape)
-            await ws.send(json.dumps(payload))  # JSON directo
-        except Exception as e:
-            print(f">>> ERROR en ws/pose: {e}")
-            break
-    print(">>> WS/pose desconectado.")
-
-@app.websocket("/ws/face")
-async def ws_face(request, ws):
-    """Envía imagen binaria (JPEG/PNG); responde JSON de face."""
-    print(">>> WS/face conectado. Enviar binario (JPEG/PNG); 'bye' para cerrar.")
-    while True:
-        try:
-            msg = await ws.recv()
-            if isinstance(msg, str):
-                if msg.lower().strip() in {"bye", "close"}:
-                    await ws.send("closing")
-                    await ws.close(code=1000, reason="bye")
-                    break
-                await ws.send("Envía imagen binaria (JPEG/PNG) o 'bye' para cerrar.")
-                continue
-
-            arr = np.frombuffer(msg, dtype=np.uint8)
-            img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
-            if img is None:
-                await ws.send("No se pudo decodificar la imagen. Usa JPEG/PNG.")
-                continue
-
-            _, result = await _process_face(img, return_image=False)
-            payload = _results_face_to_json(result, img.shape)
-            await ws.send(json.dumps(payload))
-        except Exception as e:
-            print(f">>> ERROR en ws/face: {e}")
-            break
-    print(">>> WS/face desconectado.")
 
 # ─────────────── Main ───────────────
 if __name__ == "__main__":
